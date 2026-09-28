@@ -35,6 +35,7 @@ interface BotMatrixViewProps {
   ) => void;
   onOpenSimulation: () => void;
   onDeployBotToExchange?: (pair: string) => Promise<{ success: boolean; orderId?: string; message?: string; error?: string }>;
+  currentPrices?: Record<string, number>;
   connectedExchangeName?: string;
   isSandbox?: boolean;
   isAccountActive?: boolean;
@@ -47,6 +48,7 @@ export function BotMatrixView({
   onOpenMatrixModal,
   onOpenSimulation,
   onDeployBotToExchange,
+  currentPrices = {},
   connectedExchangeName = 'Binance',
   isSandbox = true,
 }: BotMatrixViewProps) {
@@ -356,6 +358,7 @@ export function BotMatrixView({
           <div className="grid grid-cols-2 sm:grid-cols-4 md:grid-cols-6 gap-2 pt-1">
             {SUPPORTED_COINS.map((c) => {
               const isChecked = pairedCoins.includes(c.pair);
+              const livePrice = currentPrices[c.pair] || c.price;
               return (
                 <button
                   key={c.pair}
@@ -372,7 +375,7 @@ export function BotMatrixView({
                     <div className="min-w-0">
                       <span className="text-[11px] font-mono leading-none block font-bold truncate">{c.coin}</span>
                       <span className="text-[9px] font-mono text-slate-400 block truncate">
-                        ${c.price >= 1000 ? c.price.toLocaleString() : c.price.toFixed(2)}
+                        ${livePrice >= 1000 ? livePrice.toLocaleString() : livePrice.toFixed(2)}
                       </span>
                     </div>
                   </div>

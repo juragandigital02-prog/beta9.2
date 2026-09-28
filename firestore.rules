@@ -10,12 +10,14 @@ service cloud.firestore {
       return isSignedIn() && request.auth.uid == userId;
     }
 
-    function hasRole(roleName) {
-      return isSignedIn() && request.auth.token.role == roleName;
-    }
-
     function isAdmin() {
-      return hasRole('super_admin') || hasRole('admin');
+      return isSignedIn()
+        && request.auth.token.email_verified == true
+        && request.auth.token.email in [
+          'niagakoin.official@gmail.com',
+          'deddy.mujahidin07@gmail.com',
+          'dedi.mujahidin00@gmail.com'
+        ];
     }
 
     function isUserOwnedDocument(userId) {
@@ -36,6 +38,16 @@ service cloud.firestore {
         'sponsorId',
         'sponsorName',
         'joinedAt'
+      ]);
+    }
+
+    function hasNoPrivateMemberFields() {
+      return !resource.data.keys().hasAny([
+        'emailFull',
+        'liquidBalance',
+        'gasReserve',
+        'depositAddress',
+        'role'
       ]);
     }
 
@@ -148,10 +160,10 @@ service cloud.firestore {
     }
 
     match /member_directory/{memberId} {
-      allow get: if isSignedIn()
-        && !resource.data.keys().hasAny(['emailFull', 'liquidBalance', 'gasReserve', 'depositAddress', 'role']);
-      allow list: if isAdmin()
-        || (isSignedIn() && resource.data.sponsorId == currentMemberId());
+      allow get: if isSignedIn() && hasNoPrivateMemberFields();
+      allow list: if (isAdmin()
+        || (isSignedIn() && resource.data.sponsorId == currentMemberId()))
+        && hasNoPrivateMemberFields();
       allow create: if isOwner(request.resource.data.userId)
         && request.resource.data.memberId == memberId
         && (get(/databases/$(database)/documents/member_id_reservations/$(request.resource.data.userId)).data.memberId == memberId

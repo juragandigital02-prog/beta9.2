@@ -127,6 +127,7 @@ export function TradingPositionsView({
   const [isConfirmBatchTpOpen, setIsConfirmBatchTpOpen] = useState(false);
   const [isConfirmBatchPauseOpen, setIsConfirmBatchPauseOpen] = useState(false);
   const [selectedSingleTpPos, setSelectedSingleTpPos] = useState<TradingPosition | null>(null);
+  const [noProfitWarningPos, setNoProfitWarningPos] = useState<TradingPosition | null>(null);
   const [isExecutingSingleTp, setIsExecutingSingleTp] = useState(false);
   const [selectedDetailPos, setSelectedDetailPos] = useState<TradingPosition | null>(null);
   const [isDetailModalOpen, setIsDetailModalOpen] = useState(false);
@@ -258,7 +259,7 @@ export function TradingPositionsView({
 
   const handleOpenSingleTpModal = (pos: TradingPosition) => {
     if (pos.floatingPnl <= 0) {
-      showToast(`Posisi ${pos.pair} belum menghasilkan floating profit untuk di-Take Profit.`, 'warning');
+      setNoProfitWarningPos(pos);
       return;
     }
     setSelectedSingleTpPos(pos);
@@ -1245,6 +1246,54 @@ export function TradingPositionsView({
             </div>
           </div>
         </>
+      )}
+
+      {noProfitWarningPos && (
+        <div
+          className="fixed inset-0 z-[70] flex items-center justify-center p-4 bg-slate-950/75 backdrop-blur-sm animate-fadeIn"
+          role="presentation"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) setNoProfitWarningPos(null);
+          }}
+        >
+          <section
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="no-profit-warning-title"
+            className="w-full max-w-sm rounded-2xl border border-amber-500/40 bg-white p-5 text-slate-900 shadow-2xl dark:bg-[#0A1220] dark:text-white"
+          >
+            <div className="flex items-start gap-3">
+              <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-amber-500/30 bg-amber-500/10 text-amber-500">
+                <AlertTriangle className="h-5 w-5" />
+              </div>
+              <div className="min-w-0 flex-1">
+                <h3 id="no-profit-warning-title" className="text-sm font-bold">Take Profit belum tersedia</h3>
+                <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">
+                  Posisi {noProfitWarningPos.pair} belum menghasilkan floating profit untuk di-Take Profit.
+                </p>
+                <p className="mt-3 font-mono text-xs text-amber-600 dark:text-amber-400">
+                  Floating PnL: {formatUsdt(noProfitWarningPos.floatingPnl)} USDT
+                </p>
+              </div>
+              <button
+                type="button"
+                aria-label="Tutup peringatan"
+                onClick={() => setNoProfitWarningPos(null)}
+                className="-mt-1 -mr-1 rounded-md p-1 text-slate-500 hover:bg-slate-100 hover:text-slate-900 dark:hover:bg-slate-800 dark:hover:text-white"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+            <button
+              type="button"
+              autoFocus
+              onClick={() => setNoProfitWarningPos(null)}
+              className="mt-5 w-full rounded-lg bg-amber-500 px-4 py-2.5 text-sm font-semibold text-slate-950 transition hover:bg-amber-400"
+            >
+              Mengerti
+            </button>
+          </section>
+        </div>
       )}
 
       {/* Confirmation Modal: Single Coin Force Take Profit */}

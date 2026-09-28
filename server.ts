@@ -4,8 +4,31 @@ import path from 'path';
 import { createServer as createViteServer } from 'vite';
 import dotenv from 'dotenv';
 import ccxt from 'ccxt';
-import { createHash, randomInt, timingSafeEqual } from 'node:crypto';
+import { existsSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import { createCipheriv, createDecipheriv, createHash, randomBytes, randomInt, randomUUID, timingSafeEqual } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
+import { applicationDefault, getApps, initializeApp } from 'firebase-admin/app';
+import { getAuth } from 'firebase-admin/auth';
+import { getFirestore } from 'firebase-admin/firestore';
+import { z } from 'zod';
+import {
+  applyBuyFill,
+  applyRecoveredFill,
+  applySellFill,
+  BotExecutionFailure,
+  buildClientOrderId,
+  botRegistryKey,
+  classifyBotExecutionError,
+  deriveBotRunnerId,
+  getRunnerFailureState,
+  isFreshPrice,
+  retryBotExchangeAction,
+  selectOwnedBotEntries,
+  shouldExecuteTakeProfit,
+  validateMarketOrderLimits,
+} from './src/services/botEngineCore';
 import firebaseAppletConfig from './firebase-applet-config.json';
 
 dotenv.config();
@@ -18,13 +41,43 @@ const apiRequestMetrics = new Map<string, { count: number; failures: number; tot
 const SUPPORTED_EXCHANGES = new Set(['bitget', 'binance', 'okx']);
 const EXCHANGE_RETRY_ATTEMPTS = 2;
 const EXCHANGE_TIMEOUT_MS = 7000;
+const BOT_ORDER_RETRY_ATTEMPTS = 3;
+const BOT_FAILURE_PAUSE_THRESHOLD = 3;
+const BOT_RECONCILIATION_INTERVAL_MS = 5 * 60_000;
 const circuitBreakerMap = new Map<string, { failures: number; openedAt: number; cooldownMs: number }>();
-const ALLOWED_CORS_ORIGINS = new Set(['http://localhost:3000', 'http://127.0.0.1:3000', 'https://localhost:3000', 'https://127.0.0.1:3000']);
 const IS_DEVELOPMENT = process.env.NODE_ENV !== 'production';
+const ALLOWED_CORS_ORIGINS = new Set((process.env.CORS_ALLOWED_ORIGINS || (IS_DEVELOPMENT
+  ? 'http://localhost:3000,http://127.0.0.1:3000,https://localhost:3000,https://127.0.0.1:3000'
+  : '')).split(',').map((origin) => origin.trim()).filter(Boolean));
 const FIREBASE_AUTH_DOMAIN = (process.env.VITE_FIREBASE_AUTH_DOMAIN || firebaseAppletConfig.authDomain).replace(/^https?:\/\//, '');
 const FIREBASE_API_KEY = process.env.VITE_FIREBASE_API_KEY || firebaseAppletConfig.apiKey;
 const FIREBASE_PROJECT_ID = process.env.VITE_FIREBASE_PROJECT_ID || firebaseAppletConfig.projectId;
 const FIRESTORE_DATABASE_ID = process.env.VITE_FIREBASE_DATABASE_ID || firebaseAppletConfig.firestoreDatabaseId || '(default)';
+const LOCAL_ADC_CREDENTIALS_PATH = join(homedir(), '.config', 'gcloud', 'application_default_credentials.json');
+const FIREBASE_ADMIN_CREDENTIALS_CONFIGURED = Boolean(
+  (process.env.GOOGLE_APPLICATION_CREDENTIALS && existsSync(process.env.GOOGLE_APPLICATION_CREDENTIALS))
+  || existsSync(LOCAL_ADC_CREDENTIALS_PATH)
+  || process.env.K_SERVICE
+  || process.env.GAE_ENV
+  || process.env.FIREBASE_ADMIN_ENABLED === 'true'
+);
+const firebaseAdminApp = getApps()[0] ?? initializeApp({
+  credential: applicationDefault(),
+  projectId: FIREBASE_PROJECT_ID,
+});
+const firebaseAdminAuth = getAuth(firebaseAdminApp);
+const firebaseAdminFirestore = getFirestore(firebaseAdminApp, FIRESTORE_DATABASE_ID);
+const LIVE_TRADING_ENABLED = process.env.LIVE_TRADING_ENABLED === 'true';
+const LIVE_TRADING_TESTNET_ONLY = process.env.LIVE_TRADING_TESTNET_ONLY !== 'false';
+function positiveEnvLimit(name: string, fallback: number): number {
+  const value = Number(process.env[name]);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+const MAX_BOT_ORDER_USDT = positiveEnvLimit('BOT_MAX_ORDER_USDT', 50);
+const MAX_BOT_EXPOSURE_USDT = positiveEnvLimit('BOT_MAX_EXPOSURE_USDT', 250);
+const MAX_USER_EXPOSURE_USDT = positiveEnvLimit('BOT_USER_MAX_EXPOSURE_USDT', 500);
+const MAX_USER_DAILY_LOSS_USDT = positiveEnvLimit('BOT_USER_MAX_DAILY_LOSS_USDT', 25);
+const MAX_USER_ORDERS_PER_MINUTE = positiveEnvLimit('BOT_USER_MAX_ORDERS_PER_MINUTE', 5);
 const emailVerificationChallenges = new Map<string, { codeHash: string; expiresAt: number; attempts: number; sentAt: number }>();
 const SECURITY_CSP = [
   "default-src 'self'",
@@ -283,12 +336,14 @@ function getRequestId(res: Response): string {
 }
 
 function logAuditEvent(req: Request, res: Response, event: string, attributes: Record<string, string | number | boolean> = {}): void {
-  console.info('[AUDIT_EVENT]', {
+  console.info(JSON.stringify({
+    level: 'info',
+    event: 'audit',
     requestId: getRequestId(res),
-    source: 'server_observed_unverified',
-    event,
+    uid: res.locals.botUid || 'anonymous',
+    auditEvent: event,
     ...attributes,
-  });
+  }));
 }
 
 function sanitizeObservabilityAttributes(input: unknown): Record<string, string | number | boolean> {
@@ -317,7 +372,8 @@ app.options('*', (req: Request, res: Response) => {
 
 app.use((req: Request, res: Response, next) => {
   const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
-  const requestId = `req-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const requestId = randomUUID();
+  res.locals.requestId = requestId;
   const requestStartedAt = performance.now();
   const origin = typeof req.headers.origin === 'string' ? req.headers.origin : '';
 
@@ -367,7 +423,15 @@ app.use((req: Request, res: Response, next) => {
     const origin = typeof req.headers.origin === 'string' ? req.headers.origin : '';
     const referer = typeof req.headers.referer === 'string' ? req.headers.referer : '';
     const sameOrigin = !origin || origin === `http://${req.headers.host}` || origin === `https://${req.headers.host}`;
-    const validReferer = !referer || referer.startsWith('http://localhost:3000') || referer.startsWith('http://127.0.0.1:3000') || referer.startsWith('https://localhost:3000') || referer.startsWith('https://127.0.0.1:3000');
+    let validReferer = !referer;
+    if (referer) {
+      try {
+        const refererOrigin = new URL(referer).origin;
+        validReferer = refererOrigin === origin || isAllowedOrigin(refererOrigin);
+      } catch {
+        validReferer = false;
+      }
+    }
 
     if (origin && !sameOrigin && !isAllowedOrigin(origin)) {
       return next(new ApiError(403, 'CROSS_ORIGIN_FORBIDDEN', 'security', 'Cross-origin requests are not allowed for state-changing operations.', 'Permintaan lintas origin tidak diizinkan untuk operasi berbahaya.'));
@@ -415,17 +479,21 @@ app.use((req: Request, _res: Response, next) => {
 });
 app.use(express.static(path.join(process.cwd(), 'public')));
 
-app.get('/api/health', (_req: Request, res: Response) => {
+function getHealthSnapshot() {
   const totals = Array.from(apiRequestMetrics.values()).reduce((summary, metric) => ({
     requests: summary.requests + metric.count,
     failures: summary.failures + metric.failures,
     slowRequests: summary.slowRequests + metric.slowRequests,
     totalDurationMs: summary.totalDurationMs + metric.totalDurationMs,
   }), { requests: 0, failures: 0, slowRequests: 0, totalDurationMs: 0 });
+  const bots = Array.from(activeBotsRegistry.values());
+  const exchangeTickers = Array.from(tickerMemoryCache.entries())
+    .filter(([key, ticker]) => key.startsWith(`${String(ticker.source || '').toLowerCase()}:`) && ticker.source !== 'coingecko');
+  const newestExchangeTicker = exchangeTickers.reduce((newest, [, ticker]) => Math.max(newest, ticker.timestamp), 0);
 
-  res.json({
+  return {
     success: true,
-    status: 'ok',
+    status: persistenceReady ? 'ok' : 'not_ready',
     uptimeSeconds: Math.floor((Date.now() - SERVER_STARTED_AT) / 1000),
     requests: {
       total: totals.requests,
@@ -433,8 +501,46 @@ app.get('/api/health', (_req: Request, res: Response) => {
       slow: totals.slowRequests,
       averageDurationMs: totals.requests ? Number((totals.totalDurationMs / totals.requests).toFixed(1)) : 0,
     },
+    bots: {
+      active: bots.filter((bot) => bot.status === 'active').length,
+      paused: bots.filter((bot) => bot.status === 'paused').length,
+      error: bots.filter((bot) => bot.status === 'error').length,
+      total: bots.length,
+    },
+    orders: {
+      confirmed: botExecutionMetrics.confirmedOrders,
+      failed: botExecutionMetrics.failedOrders,
+      errorRate: botExecutionMetrics.confirmedOrders + botExecutionMetrics.failedOrders
+        ? Number((botExecutionMetrics.failedOrders / (botExecutionMetrics.confirmedOrders + botExecutionMetrics.failedOrders)).toFixed(4))
+        : 0,
+    },
+    ticker: {
+      requests: botExecutionMetrics.tickerRequests,
+      failures: botExecutionMetrics.tickerFailures,
+      averageLatencyMs: botExecutionMetrics.tickerRequests
+        ? Number((botExecutionMetrics.tickerTotalLatencyMs / botExecutionMetrics.tickerRequests).toFixed(1))
+        : 0,
+      latestAgeSeconds: newestExchangeTicker ? Math.max(0, Math.floor((Date.now() - newestExchangeTicker) / 1000)) : null,
+    },
     timestamp: new Date().toISOString(),
+  };
+}
+
+app.get('/healthz', (_req: Request, res: Response) => {
+  res.json({ status: 'ok', uptimeSeconds: Math.floor((Date.now() - SERVER_STARTED_AT) / 1000) });
+});
+
+app.get('/readyz', (_req: Request, res: Response) => {
+  const ready = persistenceReady;
+  res.status(ready ? 200 : 503).json({
+    status: ready ? 'ready' : 'not_ready',
+    persistenceReady: ready,
+    failureCode: ready ? undefined : persistenceFailureCode,
   });
+});
+
+app.get('/api/health', (_req: Request, res: Response) => {
+  res.json(getHealthSnapshot());
 });
 
 app.post('/api/auth/send-verification-code', async (req: Request, res: Response, next) => {
@@ -619,6 +725,71 @@ app.post('/api/observability/web-vital', (req: Request, res: Response, next) => 
 // Global in-memory cache for tickers to eliminate redundant exchange roundtrips
 const tickerMemoryCache = new Map<string, { last: number; percentage: number; timestamp: number; source?: string; quoteCurrency?: string }>();
 const TICKER_CACHE_TTL_MS = 20000; // 20s TTL
+const BOT_PRICE_MAX_AGE_MS = 10000;
+const botExecutionMetrics = { confirmedOrders: 0, failedOrders: 0, tickerRequests: 0, tickerFailures: 0, tickerTotalLatencyMs: 0 };
+
+function tickerCacheKey(exchange: string, symbol: string, isSandbox = false): string {
+  return `${exchange.trim().toLowerCase()}:${isSandbox ? 'sandbox:' : ''}${symbol.trim().toUpperCase()}`;
+}
+
+function withTimeout<T>(operation: Promise<T>, timeoutMs: number, reason: string): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout>;
+  return Promise.race([
+    operation,
+    new Promise<never>((_, reject) => {
+      timeout = setTimeout(() => reject(new Error(reason)), timeoutMs);
+    }),
+  ]).finally(() => clearTimeout(timeout));
+}
+
+async function withBotExchangeRetry<T>(operation: () => Promise<T>, timeoutMs: number, timeoutReason: string): Promise<T> {
+  return retryBotExchangeAction(
+    () => withTimeout(operation(), timeoutMs, timeoutReason),
+    BOT_ORDER_RETRY_ATTEMPTS,
+    (attempt) => new Promise((resolve) => setTimeout(resolve, 400 * (2 ** (attempt - 1)) + randomInt(0, 250)))
+  );
+}
+
+async function getPrice(exchange: string, symbol: string, isSandbox = false) {
+  const cacheKey = tickerCacheKey(exchange, symbol, isSandbox);
+  const cached = tickerMemoryCache.get(cacheKey);
+  if (cached && isFreshPrice(cached.timestamp, Date.now(), BOT_PRICE_MAX_AGE_MS) && Number.isFinite(cached.last) && cached.last > 0) {
+    return cached;
+  }
+
+  const normalizedExchange = exchange.trim().toLowerCase();
+  const client = createExchangeInstance(normalizedExchange, { isSandbox });
+  const startedAt = performance.now();
+  botExecutionMetrics.tickerRequests += 1;
+  let ticker: any;
+  try {
+    ticker = await withExchangeRetry(normalizedExchange, 'bot.fetchTicker', () => Promise.race([
+      client.fetchTicker(symbol),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('ticker_timeout')), EXCHANGE_TIMEOUT_MS)),
+    ]));
+  } catch (error) {
+    botExecutionMetrics.tickerFailures += 1;
+    throw error;
+  } finally {
+    botExecutionMetrics.tickerTotalLatencyMs += performance.now() - startedAt;
+  }
+  const last = Number(ticker.last);
+  if (!Number.isFinite(last) || last <= 0) {
+    botExecutionMetrics.tickerFailures += 1;
+    throw new Error('ticker_unavailable');
+  }
+
+  const price = {
+    last,
+    percentage: Number(ticker.percentage) || 0,
+    timestamp: Date.now(),
+    source: normalizedExchange,
+    quoteCurrency: symbol.split('/')[1]?.toUpperCase(),
+  };
+  tickerMemoryCache.set(cacheKey, price);
+  return price;
+}
+
 const COINGECKO_ID_BY_BASE: Record<string, string> = {
   BTC: 'bitcoin',
   ETH: 'ethereum',
@@ -755,15 +926,18 @@ function apiErrorHandler(err: any, req: Request, res: Response, _next: express.N
     ? sanitizeExchangeErrorMessage(err?.message || 'Permintaan tidak valid.', req.body)
     : 'Terjadi kendala pada sistem.');
 
-  console.error('[API_ERROR]', {
+  console.error(JSON.stringify({
+    level: 'error',
+    event: 'api.error',
     requestId,
     method: req.method,
     path: req.path,
+    uid: res.locals.botUid || 'anonymous',
     statusCode,
     code,
     category,
     message: logMessage,
-  });
+  }));
 
   if (isExchangeError) {
     logAuditEvent(req, res, 'exchange.error', { code, statusCode });
@@ -886,7 +1060,7 @@ async function extractPortfolioAndValuation(
     const tickerPromises = candidateCoins.map(async (item) => {
       try {
         const pairSymbol = `${item.curr}/USDT`;
-        const cacheKey = `${exchangeName.toLowerCase()}:${pairSymbol}`;
+        const cacheKey = tickerCacheKey(exchangeName, pairSymbol);
         const cached = tickerMemoryCache.get(cacheKey);
 
         let price = 0;
@@ -986,7 +1160,7 @@ app.post('/api/exchange/fetch-ticker', async (req: Request, res: Response, next)
       return next(new ApiError(400, 'EXCHANGE_UNSUPPORTED', 'validation', `Unsupported exchange: ${exchange}.`, `Exchange "${exchange}" tidak didukung.`));
     }
 
-    const cacheKey = `${exchange.toLowerCase()}:${symbol}`;
+    const cacheKey = tickerCacheKey(exchange, symbol);
     const cached = tickerMemoryCache.get(cacheKey);
 
     if (cached && Date.now() - cached.timestamp < 10000) {
@@ -1079,7 +1253,7 @@ app.post('/api/exchange/fetch-tickers-batch', async (req: Request, res: Response
     const symbolsToFetch: string[] = [];
 
     for (const symbol of symbols) {
-      const cacheKey = `${exchange}:${symbol}`;
+      const cacheKey = tickerCacheKey(exchange, symbol);
       const cached = tickerMemoryCache.get(cacheKey);
       if (cached && now - cached.timestamp < TICKER_CACHE_TTL_MS) {
         tickers[symbol] = {
@@ -1117,7 +1291,7 @@ app.post('/api/exchange/fetch-tickers-batch', async (req: Request, res: Response
           const timestamp = Number(ticker.timestamp) || Date.now();
           const percentage = Number(ticker.percentage) || 0;
           tickers[symbol] = { last, percentage, timestamp, source: exchange, quoteCurrency: 'USDT' };
-          tickerMemoryCache.set(`${exchange}:${symbol}`, { last, percentage, timestamp, source: exchange, quoteCurrency: 'USDT' });
+          tickerMemoryCache.set(tickerCacheKey(exchange, symbol), { last, percentage, timestamp, source: exchange, quoteCurrency: 'USDT' });
         } else {
           unresolvedSymbols.push(symbol);
         }
@@ -1141,7 +1315,7 @@ app.post('/api/exchange/fetch-tickers-batch', async (req: Request, res: Response
           const timestamp = Number(ticker.timestamp) || Date.now();
           const percentage = Number(ticker.percentage) || 0;
           tickers[symbol] = { last, percentage, timestamp, source: exchange, quoteCurrency: 'USDT' };
-          tickerMemoryCache.set(`${exchange}:${symbol}`, { last, percentage, timestamp, source: exchange, quoteCurrency: 'USDT' });
+          tickerMemoryCache.set(tickerCacheKey(exchange, symbol), { last, percentage, timestamp, source: exchange, quoteCurrency: 'USDT' });
         });
       }
     }
@@ -1152,7 +1326,7 @@ app.post('/api/exchange/fetch-tickers-batch', async (req: Request, res: Response
         const fallbackTickers = await fetchCoinGeckoTickers(unresolvedSymbols);
         for (const [symbol, ticker] of Object.entries(fallbackTickers)) {
           tickers[symbol] = { ...ticker, source: 'coingecko' };
-          tickerMemoryCache.set(`${exchange}:${symbol}`, {
+          tickerMemoryCache.set(tickerCacheKey(exchange, symbol), {
             ...ticker,
             source: 'coingecko',
           });
@@ -1537,7 +1711,7 @@ app.post('/api/exchange/place-order', async (req: Request, res: Response, next) 
       'XRP/USDT': 0.585,
       'DOGE/USDT': 0.38,
     };
-    const cachedPrice = tickerMemoryCache.get(`${effectiveExchange.toLowerCase()}:${cleanSymbol}`)?.last;
+    const cachedPrice = tickerMemoryCache.get(tickerCacheKey(effectiveExchange, cleanSymbol))?.last;
     const finalPrice = price ? Number(price) : (cachedPrice || defaultPrices[cleanSymbol] || 10);
 
     if (effectiveSandbox && isMockDemo) {
@@ -1570,14 +1744,51 @@ app.post('/api/exchange/place-order', async (req: Request, res: Response, next) 
       } catch {}
     }
 
-    // Execute real or testnet order
-    const order = await withExchangeRetry(effectiveExchange, 'createOrder', async () => client.createOrder(
-      cleanSymbol,
-      type,
-      side,
-      finalAmount,
-      price ? Number(price) : undefined
+    // A market order must reach a terminal state before the caller mutates its position.
+    let order: any = await withExchangeRetry(effectiveExchange, 'createOrder', async () => withTimeout(
+      client.createOrder(
+        cleanSymbol,
+        type,
+        side,
+        finalAmount,
+        price ? Number(price) : undefined
+      ),
+      EXCHANGE_TIMEOUT_MS,
+      'exchange_order_timeout'
     ));
+    let orderStatus = String(order.status || '').toLowerCase();
+    const terminalStatuses = new Set(['closed', 'filled', 'canceled', 'cancelled']);
+
+    if (order.id && !terminalStatuses.has(orderStatus)) {
+      order = await withExchangeRetry(effectiveExchange, 'fetchOrder', async () => withTimeout(
+        client.fetchOrder(order.id, cleanSymbol),
+        EXCHANGE_TIMEOUT_MS,
+        'exchange_order_status_timeout'
+      ));
+      orderStatus = String(order.status || '').toLowerCase();
+    }
+
+    if (order.id && !terminalStatuses.has(orderStatus)) {
+      await withTimeout(client.cancelOrder(order.id, cleanSymbol), EXCHANGE_TIMEOUT_MS, 'exchange_order_cancel_timeout');
+      order = await withExchangeRetry(effectiveExchange, 'fetchOrder', async () => withTimeout(
+        client.fetchOrder(order.id, cleanSymbol),
+        EXCHANGE_TIMEOUT_MS,
+        'exchange_order_status_timeout'
+      ));
+      orderStatus = String(order.status || '').toLowerCase();
+    }
+
+    const filled = Number(order.filled) || 0;
+    const fillPrice = Number(order.average || order.price) || 0;
+    if (!order.id || filled <= 0 || fillPrice <= 0 || !terminalStatuses.has(orderStatus)) {
+      return next(new ApiError(
+        502,
+        'ORDER_FILL_UNCONFIRMED',
+        'exchange',
+        'Exchange did not confirm a terminal order fill.',
+        'Bursa belum mengonfirmasi fill order. Periksa open order dan saldo exchange sebelum mencoba lagi.'
+      ));
+    }
 
     logAuditEvent(req, res, 'exchange.order.submitted', {
       exchange: effectiveExchange,
@@ -1589,9 +1800,9 @@ app.post('/api/exchange/place-order', async (req: Request, res: Response, next) 
       success: true,
       message: `Order ${side.toUpperCase()} ${symbol} berhasil dieksekusi di ${effectiveExchange.toUpperCase()} ${effectiveSandbox ? '(Testnet)' : ''}!`,
       orderId: order.id,
-      status: order.status,
-      filled: order.filled,
-      price: order.price || price || order.average,
+      status: filled < finalAmount ? 'partially_filled' : 'filled',
+      filled,
+      price: fillPrice,
       amount: order.amount,
       timestamp: order.timestamp,
     });
@@ -1783,7 +1994,7 @@ app.post('/api/exchange/test-all-coins-execution', async (req: Request, res: Res
     let note = '';
 
     // Check ticker cache for latest real price
-    const cachedTicker = tickerMemoryCache.get(`${exchange.toLowerCase()}:${item.symbol}`);
+    const cachedTicker = tickerMemoryCache.get(tickerCacheKey(exchange, item.symbol));
     if (cachedTicker?.last) {
       filledPrice = cachedTicker.last;
     }
@@ -2202,6 +2413,9 @@ app.post('/api/wallet/submit-withdraw', (req: Request, res: Response, next) => {
 // ==========================================
 interface ActiveBotRunner {
   id: string;
+  uid: string;
+  botId: string;
+  mode: 'paper' | 'live';
   botName?: string;
   pair: string;
   pairedCoins?: string[];
@@ -2220,86 +2434,685 @@ interface ActiveBotRunner {
   priceBoundaryStatus?: 'IN_RANGE' | 'ABOVE_MAX' | 'BELOW_MIN';
   stepLayer: number;
   entryPrice: number;
+  positionQty: number;
+  avgEntryPrice: number;
+  realizedPnlToday: number;
+  pnlDate: string;
   peakPrice?: number;
   troughPrice?: number;
   lastEvaluatedPrice: number;
-  status: 'active' | 'paused';
+  status: 'active' | 'paused' | 'error';
+  failureStreak: number;
+  priceFailureStreak: number;
+  lastErrorReason?: string;
+  orderSequence: number;
+  lastReconciledAt?: number;
+  resumeAfterReconciliation?: boolean;
+  pendingOrder?: {
+    clientOrderId: string;
+    side: 'buy' | 'sell';
+    requestedQty: number;
+    createdAt: number;
+    status: 'submitting' | 'filled';
+    filledQty?: number;
+    fillPrice?: number;
+    orderId?: string;
+  };
   exchange: string;
   isSandbox: boolean;
-  apiKey?: string;
-  secret?: string;
-  password?: string;
 }
 
 interface BotEngineLog {
   id: string;
+  uid: string;
   timestamp: number;
   pair: string;
   botId?: string;
   botName?: string;
-  action: 'AVERAGING_ORDER' | 'TAKE_PROFIT' | 'MONITOR_TICK' | 'GRID_TP';
+  action: 'AVERAGING_ORDER' | 'TAKE_PROFIT' | 'MONITOR_TICK' | 'GRID_TP' | 'ORDER_ERROR' | 'RUNNER_ERROR' | 'RECONCILIATION';
   details: string;
   price: number;
   stepLayer: number;
 }
 
 const activeBotsRegistry = new Map<string, ActiveBotRunner>();
+const userBotOrderTimestamps = new Map<string, number[]>();
 const botEngineLogs: BotEngineLog[] = [];
+const SERVER_INSTANCE_ID = randomUUID();
 let isEngineRunning = true;
+let persistenceReady = false;
+let persistenceFailureCode: string | undefined;
+let shutdownRequested = false;
+let workerLoopTask: Promise<void> | undefined;
+let httpServer: ReturnType<typeof app.listen> | undefined;
+let viteServer: Awaited<ReturnType<typeof createViteServer>> | undefined;
 
-// Seed initial active bot configurations for major pairs
-const initialPairs = [
-  { pair: 'BTC/USDT', price: 67250, mode: 'Avarage Only' as const, layers: 20, tp: 1.5, botName: 'BTC Trend Averager #1', minPrice: 0, maxPrice: 75000 },
-  { pair: 'BTC/USDT', price: 67250, mode: 'Grid Only' as const, layers: 100, tp: 1.2, botName: 'BTC Volatility Grid #2', minPrice: 0, maxPrice: 75000 },
-  { pair: 'ETH/USDT', price: 3480, mode: 'Avarage+Grid' as const, layers: 20, tp: 1.8, botName: 'ETH Hybrid Matrix #1', minPrice: 0, maxPrice: 4000 },
-  { pair: 'SOL/USDT', price: 178, mode: 'Avarage Only' as const, layers: 15, tp: 2.0, botName: 'SOL Rebound Scalper #1', minPrice: 0, maxPrice: 115 },
-  { pair: 'BNB/USDT', price: 585, mode: 'Grid Only' as const, layers: 50, tp: 1.2, botName: 'BNB Range Grid #1', minPrice: 0, maxPrice: 700 },
-];
+function botRunnerDocument(uid: string, runnerId: string) {
+  return firebaseAdminFirestore.collection('users').doc(uid).collection('botRunners').doc(runnerId);
+}
 
-initialPairs.forEach((p, idx) => {
-  const botId = `bot-${p.pair.replace('/', '').toLowerCase()}-${idx + 1}`;
-  activeBotsRegistry.set(botId, {
-    id: botId,
-    botName: p.botName,
-    pair: p.pair,
-    botMode: p.mode,
-    baseAmount: 35,
-    baseTp: p.tp,
-    averagingLayers: p.mode === 'Grid Only' ? 0 : p.layers,
-    gridLayers: p.mode === 'Avarage Only' ? 0 : (p.mode === 'Grid Only' ? p.layers : 100),
-    averageDownPct: 2.0,
-    uptrendFilter: true,
-    tpCallbackPct: 0.2,
-    layerCallbackPct: 0.2,
-    gridTp: 1.2,
-    minPrice: p.minPrice,
-    maxPrice: p.maxPrice,
-    priceBoundaryStatus: p.maxPrice && p.price > p.maxPrice ? 'ABOVE_MAX' : 'IN_RANGE',
-    stepLayer: 1,
-    entryPrice: p.price,
-    peakPrice: p.price,
-    troughPrice: p.price,
-    lastEvaluatedPrice: p.price,
-    status: 'active',
-    exchange: 'BINANCE',
-    isSandbox: true,
+async function persistBotRunner(bot: ActiveBotRunner): Promise<void> {
+  const state = JSON.parse(JSON.stringify({ ...bot, updatedAt: Date.now() }));
+  await botRunnerDocument(bot.uid, bot.id).set(state);
+}
+
+async function deletePersistedBotRunner(uid: string, runnerId: string): Promise<void> {
+  await botRunnerDocument(uid, runnerId).delete();
+}
+
+async function persistBotLog(log: BotEngineLog): Promise<void> {
+  const safeLog = JSON.parse(JSON.stringify(log));
+  await firebaseAdminFirestore.collection('users').doc(log.uid).collection('botLogs').doc(log.id).set(safeLog);
+}
+
+function botLeaseDocument(uid: string, runnerId: string) {
+  return firebaseAdminFirestore.collection('users').doc(uid).collection('botLocks').doc(runnerId);
+}
+
+async function acquireBotLease(bot: ActiveBotRunner): Promise<boolean> {
+  const leaseRef = botLeaseDocument(bot.uid, bot.id);
+  const runnerRef = botRunnerDocument(bot.uid, bot.id);
+  const now = Date.now();
+  const result = await firebaseAdminFirestore.runTransaction(async (transaction) => {
+    const [leaseSnapshot, runnerSnapshot] = await Promise.all([
+      transaction.get(leaseRef),
+      transaction.get(runnerRef),
+    ]);
+    if (!runnerSnapshot.exists) return { acquired: false };
+    const storedState = runnerSnapshot.data() as Partial<ActiveBotRunner>;
+    if (storedState.status !== 'active' && storedState.resumeAfterReconciliation !== true) return { acquired: false };
+    const lease = leaseSnapshot.data();
+    if (lease?.owner !== SERVER_INSTANCE_ID && Number(lease?.expiresAt || 0) > now) return { acquired: false };
+    transaction.set(leaseRef, { owner: SERVER_INSTANCE_ID, expiresAt: now + 90_000, updatedAt: now });
+    return { acquired: true, storedState };
   });
+  if (result.acquired && result.storedState) Object.assign(bot, result.storedState);
+  return result.acquired;
+}
+
+async function releaseBotLease(bot: ActiveBotRunner): Promise<void> {
+  await firebaseAdminFirestore.runTransaction(async (transaction) => {
+    const leaseRef = botLeaseDocument(bot.uid, bot.id);
+    const snapshot = await transaction.get(leaseRef);
+    if (snapshot.data()?.owner === SERVER_INSTANCE_ID) {
+      transaction.set(leaseRef, { owner: SERVER_INSTANCE_ID, expiresAt: 0, updatedAt: Date.now() });
+    }
+  });
+}
+
+async function assertBotLeaseActive(bot: ActiveBotRunner): Promise<void> {
+  await firebaseAdminFirestore.runTransaction(async (transaction) => {
+    const runnerRef = botRunnerDocument(bot.uid, bot.id);
+    const leaseRef = botLeaseDocument(bot.uid, bot.id);
+    const [runnerSnapshot, leaseSnapshot] = await Promise.all([
+      transaction.get(runnerRef),
+      transaction.get(leaseRef),
+    ]);
+    const lease = leaseSnapshot.data();
+    if (!runnerSnapshot.exists || runnerSnapshot.data()?.status !== 'active'
+      || lease?.owner !== SERVER_INSTANCE_ID || Number(lease?.expiresAt || 0) <= Date.now()) {
+      throw new BotExecutionFailure('BOT_RUNNER_NOT_LEASED', false);
+    }
+  });
+}
+
+function logBotExecutionEvent(
+  bot: ActiveBotRunner,
+  event: string,
+  attributes: Record<string, string | number | boolean> = {}
+): void {
+  console.info(JSON.stringify({
+    level: 'info',
+    event,
+    uid: bot.uid,
+    botId: bot.botId,
+    runnerId: bot.id,
+    correlationId: randomUUID(),
+    ...attributes,
+  }));
+}
+
+async function recordBotFailure(bot: ActiveBotRunner, error: unknown, action: 'ORDER_ERROR' | 'RUNNER_ERROR' | 'RECONCILIATION' = 'ORDER_ERROR'): Promise<void> {
+  const failure = classifyBotExecutionError(error);
+  const nextState = getRunnerFailureState(error, bot.failureStreak, BOT_FAILURE_PAUSE_THRESHOLD);
+  if (action === 'ORDER_ERROR') botExecutionMetrics.failedOrders += 1;
+  console.warn(JSON.stringify({
+    level: 'warn',
+    event: 'bot.runner.failure',
+    uid: bot.uid,
+    botId: bot.botId,
+    runnerId: bot.id,
+    correlationId: randomUUID(),
+    reasonCode: failure.reasonCode,
+    retryable: failure.retryable,
+  }));
+  bot.failureStreak = nextState.failureStreak;
+  bot.lastErrorReason = nextState.reasonCode;
+  bot.status = nextState.status;
+  botEngineLogs.unshift({
+    id: `log-error-${Date.now()}-${Math.random().toString(36).substring(2, 5)}`,
+    uid: bot.uid,
+    timestamp: Date.now(),
+    pair: bot.pair,
+    botId: bot.id,
+    botName: bot.botName,
+    action,
+    details: `Runner failure ${failure.reasonCode}; current status ${bot.status}.`,
+    price: bot.lastEvaluatedPrice,
+    stepLayer: bot.stepLayer,
+  });
+  if (botEngineLogs.length > 50) botEngineLogs.pop();
+  await persistBotRunner(bot);
+  await persistBotLog(botEngineLogs[0]);
+}
+
+async function restoreBotRunners(): Promise<void> {
+  if (!FIREBASE_ADMIN_CREDENTIALS_CONFIGURED) {
+    throw Object.assign(new Error('Firebase Admin ADC is not configured.'), {
+      code: 'FIREBASE_ADMIN_CREDENTIALS_NOT_CONFIGURED',
+    });
+  }
+  const snapshot = await firebaseAdminFirestore.collectionGroup('botRunners').get();
+  for (const document of snapshot.docs) {
+    const uid = document.ref.parent.parent?.id;
+    const stored = document.data() as Partial<ActiveBotRunner>;
+    if (!uid || stored.uid !== uid || stored.id !== document.id || typeof stored.botId !== 'string') continue;
+    if (!['paper', 'live'].includes(String(stored.mode)) || !['active', 'paused', 'error'].includes(String(stored.status))) continue;
+    if (typeof stored.pair !== 'string' || !/^[A-Z0-9]{2,20}\/USDT$/.test(stored.pair)) continue;
+    if (!Number.isFinite(stored.entryPrice) || Number(stored.entryPrice) <= 0) continue;
+
+    const bot = stored as ActiveBotRunner;
+    bot.positionQty = Number(bot.positionQty) || 0;
+    bot.avgEntryPrice = Number(bot.avgEntryPrice) || 0;
+    bot.realizedPnlToday = Number(bot.realizedPnlToday) || 0;
+    bot.failureStreak = Number(bot.failureStreak) || 0;
+    bot.priceFailureStreak = Number(bot.priceFailureStreak) || 0;
+    bot.orderSequence = Number(bot.orderSequence) || 0;
+    const wasActive = bot.status === 'active';
+
+    if (bot.pendingOrder?.status === 'filled'
+      && Number.isFinite(bot.pendingOrder.filledQty)
+      && Number(bot.pendingOrder.filledQty) > 0
+      && Number.isFinite(bot.pendingOrder.fillPrice)
+      && Number(bot.pendingOrder.fillPrice) > 0) {
+      const pending = bot.pendingOrder;
+      const filledQty = Number(pending.filledQty);
+      const fillPrice = Number(pending.fillPrice);
+      const recoveredPosition = applyRecoveredFill({
+        quantity: bot.positionQty,
+        averageEntryPrice: bot.avgEntryPrice,
+        realizedPnl: bot.realizedPnlToday,
+      }, { side: pending.side, filledQty, fillPrice });
+      bot.positionQty = recoveredPosition.quantity;
+      bot.avgEntryPrice = recoveredPosition.averageEntryPrice;
+      bot.realizedPnlToday = recoveredPosition.realizedPnl;
+      if (pending.side === 'buy') {
+        bot.stepLayer += 1;
+      } else {
+        if (bot.positionQty <= 1e-12) {
+          bot.positionQty = 0;
+          bot.avgEntryPrice = 0;
+          bot.stepLayer = 1;
+          bot.entryPrice = fillPrice;
+        }
+      }
+      bot.pendingOrder = undefined;
+    } else if (bot.pendingOrder) {
+      bot.status = 'paused';
+      bot.lastErrorReason = 'ORDER_STATUS_UNCERTAIN';
+      bot.resumeAfterReconciliation = false;
+    }
+
+    if (bot.mode === 'live' && wasActive && !bot.pendingOrder) {
+      bot.status = 'paused';
+      bot.resumeAfterReconciliation = true;
+      bot.lastErrorReason = 'STARTUP_RECONCILIATION_PENDING';
+    }
+    activeBotsRegistry.set(botRegistryKey(uid, bot.id), bot);
+    await persistBotRunner(bot);
+  }
+}
+
+function validateBotOrderRisk(bot: ActiveBotRunner, side: 'buy' | 'sell', quantity: number, price: number): void {
+  const notional = quantity * price;
+  if (!Number.isFinite(notional) || notional <= 0 || notional > MAX_BOT_ORDER_USDT) {
+    throw new BotExecutionFailure('RISK_MAX_ORDER_USDT', false);
+  }
+  const now = Date.now();
+  const recentOrders = (userBotOrderTimestamps.get(bot.uid) || []).filter((timestamp) => now - timestamp < 60_000);
+  userBotOrderTimestamps.set(bot.uid, recentOrders);
+  if (recentOrders.length >= MAX_USER_ORDERS_PER_MINUTE) {
+    throw new BotExecutionFailure('RISK_USER_ORDER_RATE_LIMIT', false);
+  }
+  if (side !== 'buy') return;
+
+  const currentBotExposure = bot.positionQty * (bot.avgEntryPrice || bot.lastEvaluatedPrice);
+  if (currentBotExposure + notional > MAX_BOT_EXPOSURE_USDT) {
+    throw new BotExecutionFailure('RISK_MAX_BOT_EXPOSURE_USDT', false);
+  }
+  const userExposure = Array.from(activeBotsRegistry.values())
+    .filter((candidate) => candidate.uid === bot.uid)
+    .reduce((total, candidate) => total + candidate.positionQty * (candidate.avgEntryPrice || candidate.lastEvaluatedPrice), 0);
+  if (userExposure + notional > MAX_USER_EXPOSURE_USDT) {
+    throw new BotExecutionFailure('RISK_MAX_USER_EXPOSURE_USDT', false);
+  }
+}
+
+function recordConfirmedBotOrder(uid: string): void {
+  botExecutionMetrics.confirmedOrders += 1;
+  const now = Date.now();
+  const recentOrders = (userBotOrderTimestamps.get(uid) || []).filter((timestamp) => now - timestamp < 60_000);
+  recentOrders.push(now);
+  userBotOrderTimestamps.set(uid, recentOrders);
+}
+
+function applyBotRealizedPnl(bot: ActiveBotRunner, soldQty: number, fillPrice: number): void {
+  const today = new Date().toISOString().slice(0, 10);
+  if (bot.pnlDate !== today) {
+    bot.pnlDate = today;
+    bot.realizedPnlToday = 0;
+  }
+  bot.realizedPnlToday += (fillPrice - bot.avgEntryPrice) * soldQty;
+  const userDailyPnl = Array.from(activeBotsRegistry.values())
+    .filter((candidate) => candidate.uid === bot.uid && candidate.pnlDate === today)
+    .reduce((total, candidate) => total + candidate.realizedPnlToday, 0);
+  if (userDailyPnl <= -MAX_USER_DAILY_LOSS_USDT) {
+    for (const candidate of activeBotsRegistry.values()) {
+      if (candidate.uid === bot.uid && candidate.status === 'active') {
+        candidate.status = 'paused';
+        candidate.lastErrorReason = 'RISK_DAILY_LOSS_LIMIT';
+      }
+    }
+  }
+}
+
+const CoinPairSchema = z.string().trim().toUpperCase().regex(/^[A-Z0-9]{2,20}\/USDT$/);
+const BotRegisterSchema = z.object({
+  botId: z.string().trim().regex(/^[a-zA-Z0-9_-]{1,128}$/).optional(),
+  botName: z.string().trim().max(100).optional(),
+  pair: CoinPairSchema.default('BTC/USDT'),
+  pairedCoins: z.array(CoinPairSchema).min(1).max(20).optional(),
+  botMode: z.enum(['Avarage Only', 'Grid Only', 'Avarage+Grid']).default('Avarage Only'),
+  baseAmount: z.coerce.number().min(1).max(MAX_BOT_ORDER_USDT).default(Math.min(35, MAX_BOT_ORDER_USDT)),
+  baseTp: z.coerce.number().min(0.1).max(50).default(1.5),
+  averagingLayers: z.coerce.number().int().min(0).max(20).default(20),
+  gridLayers: z.coerce.number().int().min(0).max(100).default(100),
+  averageDownPct: z.coerce.number().min(0.1).max(50).default(2),
+  uptrendFilter: z.boolean().default(true),
+  tpCallbackPct: z.coerce.number().min(0.01).max(10).default(0.2),
+  layerCallbackPct: z.coerce.number().min(0.01).max(10).default(0.2),
+  gridTp: z.coerce.number().min(0.1).max(50).default(1.2),
+  minPrice: z.coerce.number().min(0).optional().default(0),
+  maxPrice: z.coerce.number().min(0).optional().default(0),
+  entryPrice: z.coerce.number().positive().optional(),
+  exchange: z.string().trim().toUpperCase().pipe(z.enum(['BINANCE', 'BITGET', 'OKX'])).default('BINANCE'),
+  mode: z.enum(['paper', 'live']).default('paper'),
+  isSandbox: z.boolean().default(true),
+}).refine((value) => !value.pairedCoins || new Set(value.pairedCoins).size === value.pairedCoins.length, {
+  message: 'pairedCoins must not contain duplicates',
+});
+const BotCredentialSchema = z.object({
+  exchange: z.string().trim().toLowerCase().pipe(z.enum(['binance', 'bitget', 'okx'])),
+  apiKey: z.string().trim().min(8).max(512),
+  secret: z.string().trim().min(8).max(512),
+  password: z.string().max(512).optional(),
+  isSandbox: z.boolean().default(true),
 });
 
-// Periodic background worker loop (every 15 seconds)
-setInterval(async () => {
+function botCredentialDocument(uid: string, exchange: string) {
+  return firebaseAdminFirestore.collection('users').doc(uid).collection('botCredentials').doc(exchange.toLowerCase());
+}
+
+function getBotCredentialEncryptionKey(): Buffer {
+  const configuredKey = process.env.ENCRYPTION_MASTER_KEY || '';
+  const key = Buffer.from(configuredKey, 'utf8');
+  if (key.length !== 32) {
+    throw new ApiError(503, 'CREDENTIAL_ENCRYPTION_NOT_CONFIGURED', 'configuration', 'A 32-byte credential encryption key is required.', 'Penyimpanan kredensial bot belum dikonfigurasi oleh administrator.');
+  }
+  return key;
+}
+
+function encryptBotCredential(credential: z.infer<typeof BotCredentialSchema>) {
+  const iv = randomBytes(12);
+  const cipher = createCipheriv('aes-256-gcm', getBotCredentialEncryptionKey(), iv);
+  const ciphertext = Buffer.concat([
+    cipher.update(JSON.stringify(credential), 'utf8'),
+    cipher.final(),
+  ]);
+  return {
+    version: 1,
+    iv: iv.toString('base64'),
+    authTag: cipher.getAuthTag().toString('base64'),
+    ciphertext: ciphertext.toString('base64'),
+    updatedAt: Date.now(),
+  };
+}
+
+function decryptBotCredential(record: { iv: string; authTag: string; ciphertext: string }): z.infer<typeof BotCredentialSchema> {
+  const decipher = createDecipheriv('aes-256-gcm', getBotCredentialEncryptionKey(), Buffer.from(record.iv, 'base64'));
+  decipher.setAuthTag(Buffer.from(record.authTag, 'base64'));
+  const plaintext = Buffer.concat([
+    decipher.update(Buffer.from(record.ciphertext, 'base64')),
+    decipher.final(),
+  ]).toString('utf8');
+  return BotCredentialSchema.parse(JSON.parse(plaintext));
+}
+
+async function loadBotCredential(uid: string, exchange: string): Promise<z.infer<typeof BotCredentialSchema> | null> {
+  const snapshot = await botCredentialDocument(uid, exchange).get();
+  if (!snapshot.exists) return null;
+  const record = snapshot.data();
+  if (!record || record.version !== 1 || typeof record.iv !== 'string' || typeof record.authTag !== 'string' || typeof record.ciphertext !== 'string') {
+    throw new ApiError(503, 'BOT_CREDENTIAL_RECORD_INVALID', 'configuration', 'Stored bot credentials are invalid.', 'Kredensial bot tersimpan tidak valid. Hubungi administrator.');
+  }
+  return decryptBotCredential(record as { iv: string; authTag: string; ciphertext: string });
+}
+
+async function cancelBotOpenOrders(uid: string, bots: ActiveBotRunner[]): Promise<{ cancelled: number; failures: number }> {
+  const targets = new Map<string, ActiveBotRunner[]>();
+  for (const bot of bots) {
+    if (bot.mode !== 'live') continue;
+    const key = `${bot.exchange}:${bot.pair}`;
+    targets.set(key, [...(targets.get(key) || []), bot]);
+  }
+
+  let cancelled = 0;
+  let failures = 0;
+  for (const groupedBots of targets.values()) {
+    const [firstBot] = groupedBots;
+    const pendingClientOrderIds = new Set(groupedBots
+      .map((bot) => bot.pendingOrder?.status === 'submitting' ? bot.pendingOrder.clientOrderId : '')
+      .filter(Boolean));
+    try {
+      const credential = await loadBotCredential(uid, firstBot.exchange);
+      if (!credential) {
+        failures += 1;
+        continue;
+      }
+      const client = createExchangeInstance(firstBot.exchange, {
+        apiKey: credential.apiKey,
+        secret: credential.secret,
+        password: credential.password,
+        isSandbox: credential.isSandbox,
+      });
+      const openOrders = await withTimeout(client.fetchOpenOrders(firstBot.pair), EXCHANGE_TIMEOUT_MS, 'cancel_open_orders_timeout') as Array<{
+        id?: string;
+        clientOrderId?: string;
+        clientOrderID?: string;
+        info?: { clientOrderId?: string; origClientOrderId?: string };
+      }>;
+      for (const order of openOrders) {
+        const clientOrderId = String(order.clientOrderId || order.clientOrderID || order.info?.clientOrderId || order.info?.origClientOrderId || '');
+        if (!order.id || !pendingClientOrderIds.has(clientOrderId)) continue;
+        await withTimeout(client.cancelOrder(order.id, firstBot.pair), EXCHANGE_TIMEOUT_MS, 'cancel_order_timeout');
+        pendingClientOrderIds.delete(clientOrderId);
+        cancelled += 1;
+      }
+      failures += pendingClientOrderIds.size;
+    } catch {
+      failures += 1;
+    }
+  }
+  return { cancelled, failures };
+}
+
+async function executeBotMarketOrder(
+  bot: ActiveBotRunner,
+  side: 'buy' | 'sell',
+  requestedQty: number,
+  referencePrice: number,
+  priceTimestamp: number
+): Promise<{ filledQty: number; fillPrice: number; orderId: string; simulated: boolean }> {
+  const riskQty = side === 'sell'
+    ? Math.min(requestedQty, MAX_BOT_ORDER_USDT / referencePrice)
+    : requestedQty;
+  validateBotOrderRisk(bot, side, riskQty, referencePrice);
+  if (bot.mode === 'paper') {
+    bot.orderSequence += 1;
+    bot.failureStreak = 0;
+    recordConfirmedBotOrder(bot.uid);
+    logBotExecutionEvent(bot, 'bot.order.paper_simulated', {
+      side,
+      quantity: Number(riskQty.toFixed(8)),
+      price: referencePrice,
+    });
+    return {
+      filledQty: Number(riskQty.toFixed(8)),
+      fillPrice: referencePrice,
+      orderId: `paper-${bot.id}-${side}-${bot.orderSequence}`,
+      simulated: true,
+    };
+  }
+  if (!LIVE_TRADING_ENABLED) throw new BotExecutionFailure('LIVE_TRADING_DISABLED', false);
+  if (!isFreshPrice(priceTimestamp, Date.now(), BOT_PRICE_MAX_AGE_MS)) throw new BotExecutionFailure('FRESH_PRICE_UNAVAILABLE', true);
+
+  const credential = await loadBotCredential(bot.uid, bot.exchange);
+  if (!credential) throw new BotExecutionFailure('BOT_CREDENTIALS_MISSING', false);
+  const client = createExchangeInstance(bot.exchange, {
+    apiKey: credential.apiKey,
+    secret: credential.secret,
+    password: credential.password,
+    isSandbox: credential.isSandbox,
+  });
+  await withBotExchangeRetry(() => client.loadMarkets(), EXCHANGE_TIMEOUT_MS, 'exchange_market_load_timeout');
+  const market = client.market(bot.pair);
+  const amount = Number(client.amountToPrecision(bot.pair, riskQty));
+  const price = Number(client.priceToPrecision(bot.pair, referencePrice));
+  const notional = amount * price;
+  validateBotOrderRisk(bot, side, amount, price);
+  const marketLimitFailure = validateMarketOrderLimits(amount, price, market.limits || {});
+  if (marketLimitFailure) throw new BotExecutionFailure(marketLimitFailure, false);
+
+  const clientOrderId = buildClientOrderId(bot.uid, bot.botId, bot.id, side, bot.orderSequence);
+  const pendingOrder = {
+    clientOrderId,
+    side,
+    requestedQty: amount,
+    createdAt: Date.now(),
+    status: 'submitting' as const,
+  };
+  bot.pendingOrder = pendingOrder;
+  const orderDocument = firebaseAdminFirestore.collection('users').doc(bot.uid).collection('botOrders').doc(clientOrderId);
+  const runnerDocument = botRunnerDocument(bot.uid, bot.id);
+  const leaseDocument = botLeaseDocument(bot.uid, bot.id);
+  await firebaseAdminFirestore.runTransaction(async (transaction) => {
+    const [runnerSnapshot, leaseSnapshot, orderSnapshot] = await Promise.all([
+      transaction.get(runnerDocument),
+      transaction.get(leaseDocument),
+      transaction.get(orderDocument),
+    ]);
+    const lease = leaseSnapshot.data();
+    if (!runnerSnapshot.exists || runnerSnapshot.data()?.status !== 'active'
+      || lease?.owner !== SERVER_INSTANCE_ID || Number(lease?.expiresAt || 0) <= Date.now()) {
+      throw new BotExecutionFailure('BOT_RUNNER_NOT_LEASED', false);
+    }
+    if (orderSnapshot.exists) throw new BotExecutionFailure('IDEMPOTENT_ORDER_ALREADY_EXISTS', false);
+    transaction.create(orderDocument, {
+      uid: bot.uid,
+      botId: bot.botId,
+      runnerId: bot.id,
+      exchange: bot.exchange,
+      pair: bot.pair,
+      side,
+      requestedQty: amount,
+      referencePrice,
+      clientOrderId,
+      status: 'submitting',
+      createdAt: pendingOrder.createdAt,
+    });
+    transaction.set(runnerDocument, JSON.parse(JSON.stringify({ ...bot, updatedAt: Date.now() })));
+  });
+  let order: any = await withBotExchangeRetry(async () => {
+    if (!isFreshPrice(priceTimestamp, Date.now(), BOT_PRICE_MAX_AGE_MS)) {
+      throw new BotExecutionFailure('FRESH_PRICE_UNAVAILABLE', true);
+    }
+    await assertBotLeaseActive(bot);
+    return client.createOrder(bot.pair, 'market', side, amount, undefined, { clientOrderId });
+  }, EXCHANGE_TIMEOUT_MS, 'exchange_order_timeout');
+  if (!order?.id) throw new BotExecutionFailure('ORDER_ID_MISSING', false);
+  let orderStatus = String(order.status).toLowerCase();
+  if (!['closed', 'filled', 'canceled', 'cancelled'].includes(orderStatus) && order.id) {
+    try {
+      await withTimeout(client.cancelOrder(order.id, bot.pair), EXCHANGE_TIMEOUT_MS, 'exchange_partial_order_cancel_timeout');
+      order = await withTimeout(client.fetchOrder(order.id, bot.pair), EXCHANGE_TIMEOUT_MS, 'exchange_order_status_timeout');
+    } catch {
+      throw new BotExecutionFailure('ORDER_STATUS_UNCONFIRMED', false);
+    }
+    orderStatus = String(order.status).toLowerCase();
+  } else if ((!Number(order.filled) || Number(order.filled) <= 0) && order.id) {
+    try {
+      order = await withTimeout(client.fetchOrder(order.id, bot.pair), EXCHANGE_TIMEOUT_MS, 'exchange_order_status_timeout');
+      orderStatus = String(order.status).toLowerCase();
+    } catch {
+      throw new BotExecutionFailure('ORDER_STATUS_UNCONFIRMED', false);
+    }
+  }
+  const filledQty = Number(order.filled) || 0;
+  const fillPrice = Number(order.average || order.price) || 0;
+  if (!order.id || filledQty <= 0 || fillPrice <= 0 || !['closed', 'filled', 'canceled', 'cancelled'].includes(orderStatus)) {
+    throw new BotExecutionFailure('ORDER_NOT_CONFIRMED_FILLED', false);
+  }
+  bot.pendingOrder = { ...pendingOrder, status: 'filled', filledQty, fillPrice, orderId: String(order.id) };
+  bot.orderSequence += 1;
+  bot.failureStreak = 0;
+  bot.lastErrorReason = undefined;
+  await persistBotRunner(bot);
+  await orderDocument.set({
+    status: filledQty < amount ? 'partially_filled' : 'filled',
+    exchangeOrderId: String(order.id),
+    filledQty,
+    fillPrice,
+    filledAt: Date.now(),
+  }, { merge: true });
+  recordConfirmedBotOrder(bot.uid);
+  logBotExecutionEvent(bot, 'bot.order.confirmed', {
+    side,
+    exchange: bot.exchange,
+    pair: bot.pair,
+    exchangeOrderId: String(order.id),
+    clientOrderId,
+    filledQty,
+    fillPrice,
+  });
+  return { filledQty, fillPrice, orderId: String(order.id), simulated: false };
+}
+
+async function reconcileLiveBotPosition(bot: ActiveBotRunner): Promise<void> {
+  const credential = await loadBotCredential(bot.uid, bot.exchange);
+  if (!credential) throw new BotExecutionFailure('BOT_CREDENTIALS_MISSING', false);
+  const client = createExchangeInstance(bot.exchange, {
+    apiKey: credential.apiKey,
+    secret: credential.secret,
+    password: credential.password,
+    isSandbox: credential.isSandbox,
+  });
+  const [balanceResult, openOrdersResult] = await Promise.all([
+    withTimeout(client.fetchBalance(), EXCHANGE_TIMEOUT_MS, 'reconciliation_balance_timeout'),
+    withTimeout(client.fetchOpenOrders(bot.pair), EXCHANGE_TIMEOUT_MS, 'reconciliation_orders_timeout'),
+  ]);
+  const balance = balanceResult as { total?: Record<string, number>; free?: Record<string, number> };
+  const openOrders = openOrdersResult as Array<{ id?: string }>;
+  const baseAsset = bot.pair.split('/')[0];
+  const exchangeQty = Number(balance.total?.[baseAsset] ?? balance.free?.[baseAsset] ?? 0);
+  const tolerance = Math.max(1e-8, bot.positionQty * 0.005);
+  if (exchangeQty + tolerance < bot.positionQty) {
+    throw new BotExecutionFailure('POSITION_BALANCE_MISMATCH', false);
+  }
+  if (openOrders.length > 0) throw new BotExecutionFailure('UNTRACKED_OPEN_ORDERS', false);
+  bot.lastReconciledAt = Date.now();
+  botEngineLogs.unshift({
+    id: `log-reconcile-${Date.now()}-${Math.random().toString(36).substring(2, 5)}`,
+    uid: bot.uid,
+    timestamp: Date.now(),
+    pair: bot.pair,
+    botId: bot.id,
+    botName: bot.botName,
+    action: 'RECONCILIATION',
+    details: 'Exchange balance and open orders match the runner state.',
+    price: bot.lastEvaluatedPrice,
+    stepLayer: bot.stepLayer,
+  });
+  if (botEngineLogs.length > 50) botEngineLogs.pop();
+}
+
+app.use('/api/bot', async (req: Request, res: Response, next) => {
+  const authorization = req.header('authorization') || '';
+  const idToken = authorization.startsWith('Bearer ') ? authorization.slice(7) : '';
+  if (!idToken) {
+    return next(new ApiError(401, 'AUTH_REQUIRED', 'authentication', 'A valid Firebase sign-in is required.', 'Silakan login ulang dengan akun Firebase yang valid.'));
+  }
+
+  try {
+    const decodedToken = await firebaseAdminAuth.verifyIdToken(idToken, true);
+    res.locals.botUid = decodedToken.uid;
+    if (!checkGlobalRequestRateLimit(`bot-uid:${decodedToken.uid}`, 60, 60000)) {
+      return next(new ApiError(429, 'RATE_LIMITED', 'rate_limit', 'Bot API rate limit exceeded.', 'Terlalu banyak permintaan bot. Silakan tunggu sebentar.'));
+    }
+    if (!persistenceReady) {
+      return next(new ApiError(503, 'BOT_STORAGE_UNAVAILABLE', 'configuration', 'Persistent bot storage is unavailable.', 'Penyimpanan bot belum siap. Coba lagi setelah layanan pulih.'));
+    }
+    next();
+  } catch {
+    next(new ApiError(401, 'AUTH_INVALID', 'authentication', 'Firebase sign-in token is invalid or expired.', 'Sesi login berakhir. Silakan login ulang.'));
+  }
+});
+
+// Serial worker loop; the next cycle starts only after the previous one finishes.
+async function runBotCycle(): Promise<void> {
   if (!isEngineRunning || activeBotsRegistry.size === 0) return;
 
   for (const [botId, bot] of activeBotsRegistry.entries()) {
-    if (bot.status !== 'active') continue;
+    if (bot.status !== 'active' && bot.resumeAfterReconciliation !== true) continue;
 
+    let leased = false;
     try {
-      // Get current price from memory cache or simulate realistic market movement
-      const cached = tickerMemoryCache.get(bot.pair);
-      const randomFluctuation = (Math.random() - 0.49) * 0.003; // Micro variation
-      const currentPrice = cached
-        ? cached.last
-        : Number((bot.lastEvaluatedPrice * (1 + randomFluctuation)).toFixed(2));
+      if (!(await acquireBotLease(bot))) continue;
+      leased = true;
+      if (bot.resumeAfterReconciliation) {
+        await reconcileLiveBotPosition(bot);
+        bot.resumeAfterReconciliation = false;
+        bot.status = 'active';
+        bot.lastErrorReason = undefined;
+        await persistBotRunner(bot);
+        continue;
+      }
+      if (bot.mode === 'live' && Date.now() - (bot.lastReconciledAt || 0) >= BOT_RECONCILIATION_INTERVAL_MS) {
+        try {
+          await reconcileLiveBotPosition(bot);
+        } catch (error) {
+          await recordBotFailure(bot, error, 'RECONCILIATION');
+          continue;
+        }
+      }
+      let cached: Awaited<ReturnType<typeof getPrice>>;
+      try {
+        cached = await getPrice(bot.exchange, bot.pair, bot.isSandbox);
+      } catch {
+        bot.priceFailureStreak += 1;
+        if (bot.priceFailureStreak >= BOT_FAILURE_PAUSE_THRESHOLD) {
+          bot.status = 'paused';
+          bot.lastErrorReason = 'FRESH_PRICE_UNAVAILABLE';
+        }
+        botEngineLogs.unshift({
+          id: `log-stale-${Date.now()}-${Math.random().toString(36).substring(2, 5)}`,
+          uid: bot.uid,
+          timestamp: Date.now(),
+          pair: bot.pair,
+          botId: bot.id,
+          botName: bot.botName,
+          action: 'RUNNER_ERROR',
+          details: `Fresh exchange price unavailable; cycle skipped (${bot.priceFailureStreak}/${BOT_FAILURE_PAUSE_THRESHOLD}).`,
+          price: bot.lastEvaluatedPrice,
+          stepLayer: bot.stepLayer,
+        });
+        if (botEngineLogs.length > 50) botEngineLogs.pop();
+        await persistBotLog(botEngineLogs[0]);
+        if (bot.status === 'paused') await persistBotRunner(bot);
+        continue;
+      }
+      if (Date.now() - cached.timestamp > BOT_PRICE_MAX_AGE_MS) continue;
+      bot.priceFailureStreak = 0;
+      const currentPrice = cached.last;
 
       bot.lastEvaluatedPrice = currentPrice;
       if (!bot.peakPrice || currentPrice > bot.peakPrice) bot.peakPrice = currentPrice;
@@ -2307,7 +3120,10 @@ setInterval(async () => {
 
       // Calculate price deviation from initial/entry price
       const priceDropPct = ((bot.entryPrice - currentPrice) / bot.entryPrice) * 100;
-      const priceGainPct = ((currentPrice - bot.entryPrice) / bot.entryPrice) * 100;
+      const positionReferencePrice = bot.avgEntryPrice || bot.entryPrice;
+      const priceGainPct = bot.positionQty > 0
+        ? ((currentPrice - positionReferencePrice) / positionReferencePrice) * 100
+        : 0;
 
       // Min & Max Price Boundary Check (Applies to ALL bots)
       // "Jadi meskipun bot di start/posisi on kalau harga masih diatas 115, bot tidak buy. terapkan ke semua bot"
@@ -2327,37 +3143,57 @@ setInterval(async () => {
       const targetTp = bot.botMode === 'Grid Only' ? (bot.gridTp || 1.2) : bot.baseTp;
       const useTpCallback = bot.botMode !== 'Grid Only'; // Averager & Avarage+Grid use TP callback
 
-      if (priceGainPct >= targetTp) {
-        const cbPct = bot.tpCallbackPct || 0.2;
-        const pullbackFromPeak = bot.peakPrice ? ((bot.peakPrice - currentPrice) / bot.peakPrice) * 100 : 0;
-        
-        // Grid can execute immediately at targetTp or upon slight retreat;
-        // Averager waits for pullbackFromPeak >= cbPct (or high overshoot >= targetTp + 0.8%)
-        const shouldExecuteTp = !useTpCallback
-          ? (priceGainPct >= targetTp)
-          : (pullbackFromPeak >= cbPct || priceGainPct >= targetTp + 0.8);
+      const shouldExecuteTp = shouldExecuteTakeProfit({
+        quantity: bot.positionQty,
+        gainPct: priceGainPct,
+        targetPct: targetTp,
+        peakPrice: bot.peakPrice || currentPrice,
+        currentPrice,
+        callbackPct: bot.tpCallbackPct || 0.2,
+        useCallback: useTpCallback,
+      });
 
-        if (shouldExecuteTp) {
-          bot.stepLayer = 1;
-          bot.entryPrice = currentPrice;
-          bot.peakPrice = currentPrice;
-          bot.troughPrice = currentPrice;
+      if (shouldExecuteTp) {
+          const fill = await executeBotMarketOrder(bot, 'sell', bot.positionQty, currentPrice, cached.timestamp);
+          applyBotRealizedPnl(bot, fill.filledQty, fill.fillPrice);
+          for (const candidate of activeBotsRegistry.values()) {
+            if (candidate.uid === bot.uid && candidate.lastErrorReason === 'RISK_DAILY_LOSS_LIMIT') {
+              await persistBotRunner(candidate);
+            }
+          }
+          const updatedPosition = applySellFill({
+            quantity: bot.positionQty,
+            averageEntryPrice: bot.avgEntryPrice,
+            realizedPnl: 0,
+          }, fill.filledQty, fill.fillPrice);
+          bot.positionQty = updatedPosition.quantity;
+          if (bot.positionQty <= 1e-12) {
+            bot.positionQty = 0;
+            bot.avgEntryPrice = 0;
+            bot.stepLayer = 1;
+            bot.entryPrice = fill.fillPrice;
+            bot.peakPrice = fill.fillPrice;
+            bot.troughPrice = fill.fillPrice;
+          }
 
           const logItem: BotEngineLog = {
             id: `log-tp-${Date.now()}-${Math.random().toString(36).substring(2, 5)}`,
+            uid: bot.uid,
             timestamp: Date.now(),
             pair: bot.pair,
             botId: bot.id,
             botName: bot.botName,
             action: 'TAKE_PROFIT',
-            details: `[${bot.botName || bot.pair}] Take Profit otomatis tercapai (+${priceGainPct.toFixed(2)}% >= ${targetTp}%${useTpCallback ? ` dengan TP Callback ${cbPct}%` : ''}). Seluruh layer dieksekusi & siklus baru dimulai.`,
-            price: currentPrice,
-            stepLayer: 1,
+            details: `[${bot.botName || bot.pair}] ${fill.simulated ? 'PAPER SELL simulated' : `SELL ${fill.filledQty} @ ${fill.fillPrice} confirmed (${fill.orderId})`} after take-profit (+${priceGainPct.toFixed(2)}%).`,
+            price: fill.fillPrice,
+            stepLayer: bot.stepLayer,
           };
           botEngineLogs.unshift(logItem);
           if (botEngineLogs.length > 50) botEngineLogs.pop();
+          bot.pendingOrder = undefined;
+          await persistBotRunner(bot);
+          await persistBotLog(logItem);
           continue;
-        }
       }
 
       // 2. Averaging Down / Grid Trigger Condition
@@ -2379,6 +3215,7 @@ setInterval(async () => {
           if (!botEngineLogs.some((l) => l.botId === bot.id && l.details.includes('Proteksi Max Price') && Date.now() - l.timestamp < 60000)) {
             botEngineLogs.unshift({
               id: `log-max-${Date.now()}-${Math.random().toString(36).substring(2, 5)}`,
+              uid: bot.uid,
               timestamp: Date.now(),
               pair: bot.pair,
               botId: bot.id,
@@ -2398,6 +3235,7 @@ setInterval(async () => {
           if (!botEngineLogs.some((l) => l.botId === bot.id && l.details.includes('Proteksi Min Price') && Date.now() - l.timestamp < 60000)) {
             botEngineLogs.unshift({
               id: `log-min-${Date.now()}-${Math.random().toString(36).substring(2, 5)}`,
+              uid: bot.uid,
               timestamp: Date.now(),
               pair: bot.pair,
               botId: bot.id,
@@ -2423,89 +3261,110 @@ setInterval(async () => {
 
         // Trigger order only when price has rebounded from trough by layerCallbackPct
         if (reboundFromTrough >= layerCb || priceDropPct >= nextTriggerDrop + 1.2) {
+          const requestedQty = bot.baseAmount / currentPrice;
+          const fill = await executeBotMarketOrder(bot, 'buy', requestedQty, currentPrice, cached.timestamp);
+          const updatedPosition = applyBuyFill({
+            quantity: bot.positionQty,
+            averageEntryPrice: bot.avgEntryPrice,
+            realizedPnl: bot.realizedPnlToday,
+          }, fill.filledQty, fill.fillPrice);
+          bot.positionQty = updatedPosition.quantity;
+          bot.avgEntryPrice = updatedPosition.averageEntryPrice;
           bot.stepLayer += 1;
           bot.troughPrice = currentPrice;
-
-          // If credentials exist, place order via CCXT
-          if (bot.apiKey && bot.secret) {
-            try {
-              const client = createExchangeInstance(bot.exchange, {
-                apiKey: bot.apiKey,
-                secret: bot.secret,
-                password: bot.password,
-                isSandbox: bot.isSandbox,
-              });
-              const amount = Number((bot.baseAmount / currentPrice).toFixed(5));
-              await client.createOrder(bot.pair, 'market', 'buy', amount);
-            } catch {
-              // Handled gracefully
-            }
-          }
 
           const isGridLayer = bot.botMode === 'Grid Only' || (bot.botMode === 'Avarage+Grid' && bot.stepLayer > (bot.averagingLayers || 20));
           const logItem: BotEngineLog = {
             id: `log-avg-${Date.now()}-${Math.random().toString(36).substring(2, 5)}`,
+            uid: bot.uid,
             timestamp: Date.now(),
             pair: bot.pair,
             botId: bot.id,
             botName: bot.botName,
             action: isGridLayer ? 'GRID_TP' : 'AVERAGING_ORDER',
-            details: `[${bot.botName || bot.pair}] Drop -${priceDropPct.toFixed(2)}% terdeteksi + pantulan rebound Layer-CB +${reboundFromTrough.toFixed(2)}% (Target CB: ${layerCb}%). Order Layer #${bot.stepLayer}/${maxAllowedLayers} [${isGridLayer ? 'Grid Sub-Layer' : 'Averaging Layer'}] berhasil dieksekusi!`,
-            price: currentPrice,
+            details: `[${bot.botName || bot.pair}] ${fill.simulated ? 'PAPER BUY simulated' : `BUY ${fill.filledQty} @ ${fill.fillPrice} confirmed (${fill.orderId})`} for layer #${bot.stepLayer}/${maxAllowedLayers} [${isGridLayer ? 'Grid Sub-Layer' : 'Averaging Layer'}].`,
+            price: fill.fillPrice,
             stepLayer: bot.stepLayer,
           };
           botEngineLogs.unshift(logItem);
           if (botEngineLogs.length > 50) botEngineLogs.pop();
+          bot.pendingOrder = undefined;
+          await persistBotRunner(bot);
+          await persistBotLog(logItem);
         }
       }
-    } catch (err: any) {
-      // Loop continues safely
+    } catch (error) {
+      await recordBotFailure(bot, error).catch(() => {});
+    } finally {
+      if (leased) await releaseBotLease(bot).catch(() => {});
     }
   }
-}, 15000);
+}
+
+async function runBotWorkerLoop(): Promise<void> {
+  while (!shutdownRequested) {
+    await runBotCycle();
+    if (shutdownRequested) break;
+    await new Promise((resolve) => setTimeout(resolve, 15000));
+  }
+}
 
 // API: Register or update active bot in background runner
-app.post('/api/bot/register', (req: Request, res: Response, next) => {
+app.post('/api/bot/register', async (req: Request, res: Response, next) => {
   try {
+    const parsed = BotRegisterSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return next(new ApiError(400, 'BOT_CONFIGURATION_INVALID', 'validation', 'Bot configuration failed validation.', 'Konfigurasi bot tidak valid. Periksa simbol dan batas parameter.'));
+    }
+
+    const uid = res.locals.botUid as string;
     const {
-      botId: customBotId,
+      botId: requestedBotId,
       botName,
-      pair = 'BTC/USDT',
+      pair,
       pairedCoins,
-      botMode = 'Avarage Only',
-      baseAmount = 35,
-      baseTp = 1.5,
-      averagingLayers = 20,
-      gridLayers = 100,
-      averageDownPct = 2.0,
-      uptrendFilter = true,
-      tpCallbackPct = 0.2,
-      layerCallbackPct = 0.2,
-      gridTp = 1.2,
-      minPrice = 0,
-      maxPrice = 0,
-      entryPrice = 67000,
-      exchange = 'BINANCE',
-      isSandbox = true,
-      apiKey,
-      secret,
-      password,
-    } = req.body;
-
-    const coinsToRegister: string[] = Array.isArray(pairedCoins) && pairedCoins.length > 0
-      ? pairedCoins
-      : [pair];
-
-    const baseBotId = customBotId || `bot-multi-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+      botMode,
+      baseAmount,
+      baseTp,
+      averagingLayers,
+      gridLayers,
+      averageDownPct,
+      uptrendFilter,
+      tpCallbackPct,
+      layerCallbackPct,
+      gridTp,
+      minPrice,
+      maxPrice,
+      entryPrice,
+      exchange,
+      isSandbox,
+      mode,
+    } = parsed.data;
+    if (mode === 'live' && !LIVE_TRADING_ENABLED) {
+      return next(new ApiError(403, 'LIVE_TRADING_DISABLED', 'security', 'Live trading is disabled on this server.', 'Trading live belum diaktifkan oleh administrator.'));
+    }
+    if (mode === 'live' && LIVE_TRADING_TESTNET_ONLY && !isSandbox) {
+      return next(new ApiError(403, 'LIVE_TRADING_TESTNET_ONLY', 'security', 'This server allows live-mode bot orders only against exchange testnet.', 'Server ini hanya mengizinkan mode live ke exchange Testnet.'));
+    }
+    if (mode === 'live') {
+      const botCredential = await loadBotCredential(uid, exchange);
+      if (!botCredential) {
+        return next(new ApiError(409, 'BOT_CREDENTIALS_REQUIRED', 'validation', 'Encrypted exchange credentials are required for live trading.', 'Simpan kredensial exchange terlebih dahulu untuk memakai mode live.'));
+      }
+      if (botCredential.isSandbox !== isSandbox) {
+        return next(new ApiError(409, 'BOT_EXCHANGE_MODE_MISMATCH', 'validation', 'Bot sandbox mode must match the encrypted exchange credentials.', 'Mode bot harus sama dengan mode API exchange yang tersimpan.'));
+      }
+    }
+    const coinsToRegister = pairedCoins?.length ? pairedCoins : [pair];
+    const baseBotId = requestedBotId || `bot-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const finalBotName = botName || `GAIN ${botMode} (${coinsToRegister.length} Koin)`;
-
-    const avgL = Number(averagingLayers) || (botMode === 'Grid Only' ? 0 : 20);
-    const gridL = Number(gridLayers) || (botMode === 'Avarage Only' ? 0 : 100);
-    const parsedMinPrice = Number(minPrice) || 0;
-    const parsedMaxPrice = Number(maxPrice) || 0;
+    const avgL = botMode === 'Grid Only' ? 0 : averagingLayers;
+    const gridL = botMode === 'Avarage Only' ? 0 : gridLayers;
+    const parsedMinPrice = minPrice;
+    const parsedMaxPrice = maxPrice;
 
     for (const coinPair of coinsToRegister) {
-      const runnerId = coinsToRegister.length === 1 && customBotId ? customBotId : `${baseBotId}_${coinPair.replace('/', '').toLowerCase()}`;
+      const runnerId = deriveBotRunnerId(baseBotId, coinPair, coinsToRegister.length > 1);
       const defaultCoinPrices: Record<string, number> = {
         'BTC/USDT': 67250,
         'ETH/USDT': 3480,
@@ -2520,16 +3379,27 @@ app.post('/api/bot/register', (req: Request, res: Response, next) => {
         'XRP/USDT': 0.585,
         'DOGE/USDT': 0.38,
       };
-      const cached = tickerMemoryCache.get(coinPair);
-      const initialPrice = cached?.last || Number(entryPrice) || defaultCoinPrices[coinPair] || 50;
+      const cached = tickerMemoryCache.get(tickerCacheKey(exchange, coinPair, isSandbox));
+      const initialPrice = mode === 'live'
+        ? (await getPrice(exchange, coinPair, isSandbox)).last
+        : cached?.last || entryPrice || defaultCoinPrices[coinPair] || 50;
       const boundaryStatus = (parsedMaxPrice > 0 && initialPrice > parsedMaxPrice)
         ? 'ABOVE_MAX'
         : (parsedMinPrice > 0 && initialPrice < parsedMinPrice)
         ? 'BELOW_MIN'
         : 'IN_RANGE';
 
-      activeBotsRegistry.set(runnerId, {
+      const registryKey = botRegistryKey(uid, runnerId);
+      const previousRunner = activeBotsRegistry.get(registryKey);
+      if (previousRunner) {
+        previousRunner.status = 'paused';
+        await persistBotRunner(previousRunner);
+      }
+      const runner: ActiveBotRunner = {
         id: runnerId,
+        uid,
+        botId: baseBotId,
+        mode,
         botName: finalBotName,
         pair: coinPair,
         pairedCoins: coinsToRegister,
@@ -2551,16 +3421,26 @@ app.post('/api/bot/register', (req: Request, res: Response, next) => {
         peakPrice: initialPrice,
         troughPrice: initialPrice,
         lastEvaluatedPrice: initialPrice,
-        status: 'active',
-        exchange,
+        positionQty: 0,
+        avgEntryPrice: 0,
+        realizedPnlToday: 0,
+        pnlDate: new Date().toISOString().slice(0, 10),
+        failureStreak: 0,
+        priceFailureStreak: 0,
+        orderSequence: 0,
+        status: 'paused',
+        exchange: exchange.toUpperCase(),
         isSandbox,
-        apiKey,
-        secret,
-        password,
-      });
+      };
+      await persistBotRunner(runner);
+      runner.status = 'active';
+      await persistBotRunner(runner);
+      activeBotsRegistry.set(registryKey, runner);
     }
 
     logAuditEvent(req, res, 'bot.registered', {
+      uid,
+      botId: baseBotId,
       exchange: String(exchange).slice(0, 20),
       pairedCoinCount: coinsToRegister.length,
       sandbox: Boolean(isSandbox),
@@ -2571,28 +3451,120 @@ app.post('/api/bot/register', (req: Request, res: Response, next) => {
       botId: baseBotId,
       botName: finalBotName,
       pairedCoins: coinsToRegister,
-      activeCount: activeBotsRegistry.size,
+      activeCount: Array.from(activeBotsRegistry.values()).filter((bot) => bot.uid === uid).length,
     });
   } catch (err: any) {
     return next(err);
   }
 });
 
-// API: Delete specific bot from background runner
-app.post('/api/bot/delete', (req: Request, res: Response, next) => {
+app.post('/api/bot/credentials', async (req: Request, res: Response, next) => {
   try {
-    const { botId } = req.body;
-    if (botId && activeBotsRegistry.has(botId)) {
-      const bot = activeBotsRegistry.get(botId);
-      activeBotsRegistry.delete(botId);
-      logAuditEvent(req, res, 'bot.deleted', { found: true });
+    const parsed = BotCredentialSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return next(new ApiError(400, 'BOT_CREDENTIALS_INVALID', 'validation', 'Exchange credentials failed validation.', 'Kredensial exchange tidak valid.'));
+    }
+    const uid = res.locals.botUid as string;
+    const credential = sanitizeExchangeInput(parsed.data, { requirePassphrase: parsed.data.exchange !== 'binance' });
+    const encrypted = encryptBotCredential({ ...credential, exchange: parsed.data.exchange, isSandbox: parsed.data.isSandbox });
+    await botCredentialDocument(uid, credential.exchange).set(encrypted);
+    logAuditEvent(req, res, 'bot.credentials.updated', { uid, exchange: credential.exchange });
+    res.json({ success: true, exchange: credential.exchange, encryptedAtRest: true });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/bot/disconnect-exchange', async (req: Request, res: Response, next) => {
+  try {
+    const parsed = z.object({ exchange: z.string().trim().toLowerCase().pipe(z.enum(['binance', 'bitget', 'okx'])) }).safeParse(req.body);
+    if (!parsed.success) {
+      return next(new ApiError(400, 'EXCHANGE_INVALID', 'validation', 'Exchange is invalid.', 'Exchange tidak valid.'));
+    }
+    const uid = res.locals.botUid as string;
+    const ownedBots = selectOwnedBotEntries(Array.from(activeBotsRegistry.entries()), uid)
+      .filter(([, bot]) => bot.exchange.toLowerCase() === parsed.data.exchange);
+    ownedBots.forEach(([, bot]) => { bot.status = 'paused'; });
+    await Promise.all(ownedBots.map(([, bot]) => persistBotRunner(bot)));
+    const cancellation = await cancelBotOpenOrders(uid, ownedBots.map(([, bot]) => bot));
+    if (cancellation.failures > 0) {
+      return next(new ApiError(503, 'OPEN_ORDER_CANCELLATION_INCOMPLETE', 'exchange', 'Exchange open orders could not all be confirmed cancelled; credentials were retained.', 'Sebagian open order belum dapat dipastikan batal. Kredensial tetap disimpan dan bot dijeda agar dapat dicoba lagi.'));
+    }
+    await botCredentialDocument(uid, parsed.data.exchange).delete();
+    logAuditEvent(req, res, 'bot.exchange.disconnected', {
+      uid,
+      exchange: parsed.data.exchange,
+      pausedRunnerCount: ownedBots.length,
+      cancelledOrderCount: cancellation.cancelled,
+    });
+    res.json({
+      success: true,
+      exchange: parsed.data.exchange,
+      pausedRunnerCount: ownedBots.length,
+      cancelledOrderCount: cancellation.cancelled,
+      cancellationFailures: cancellation.failures,
+      credentialsDeleted: true,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/bot/kill-switch', async (req: Request, res: Response, next) => {
+  try {
+    const uid = res.locals.botUid as string;
+    const ownedBots = selectOwnedBotEntries(Array.from(activeBotsRegistry.entries()), uid);
+    ownedBots.forEach(([, bot]) => { bot.status = 'paused'; });
+    await Promise.all(ownedBots.map(([, bot]) => persistBotRunner(bot)));
+    const cancellation = await cancelBotOpenOrders(uid, ownedBots.map(([, bot]) => bot));
+    if (cancellation.failures > 0) {
+      return next(new ApiError(503, 'OPEN_ORDER_CANCELLATION_INCOMPLETE', 'exchange', 'Exchange open orders could not all be confirmed cancelled; runners remain paused.', 'Sebagian open order belum dapat dipastikan batal. Bot tetap dijeda dan belum dihapus.'));
+    }
+    logAuditEvent(req, res, 'bot.kill_switch', {
+      uid,
+      pausedRunnerCount: ownedBots.length,
+      cancelledOrderCount: cancellation.cancelled,
+    });
+    res.json({
+      success: true,
+      pausedRunnerCount: ownedBots.length,
+      cancelledOrderCount: cancellation.cancelled,
+      cancellationFailures: cancellation.failures,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// API: Delete specific bot from background runner
+app.post('/api/bot/delete', async (req: Request, res: Response, next) => {
+  try {
+    const parsed = z.object({ botId: z.string().trim().regex(/^[a-zA-Z0-9_-]{1,128}$/) }).safeParse(req.body);
+    if (!parsed.success) {
+      return next(new ApiError(400, 'BOT_ID_INVALID', 'validation', 'Bot id is invalid.', 'ID bot tidak valid.'));
+    }
+    const uid = res.locals.botUid as string;
+    const ownedRunners = selectOwnedBotEntries(Array.from(activeBotsRegistry.entries()), uid)
+      .filter(([, bot]) => bot.botId === parsed.data.botId || bot.id === parsed.data.botId);
+    if (ownedRunners.length > 0) {
+      ownedRunners.forEach(([, bot]) => { bot.status = 'paused'; });
+      await Promise.all(ownedRunners.map(([, bot]) => persistBotRunner(bot)));
+      const cancellation = await cancelBotOpenOrders(uid, ownedRunners.map(([, bot]) => bot));
+      if (cancellation.failures > 0) {
+        return next(new ApiError(503, 'OPEN_ORDER_CANCELLATION_INCOMPLETE', 'exchange', 'Exchange open orders could not all be confirmed cancelled; runners remain paused.', 'Sebagian open order belum dapat dipastikan batal. Bot tetap dijeda dan belum dihapus.'));
+      }
+      await Promise.all(ownedRunners.map(([, bot]) => deletePersistedBotRunner(uid, bot.id)));
+      ownedRunners.forEach(([key]) => activeBotsRegistry.delete(key));
+      logAuditEvent(req, res, 'bot.deleted', { uid, botId: parsed.data.botId, found: true });
       return res.json({
         success: true,
-        message: `Bot "${bot?.botName || botId}" berhasil dihapus dari background engine.`,
-        activeCount: activeBotsRegistry.size,
+        message: `Bot "${ownedRunners[0][1].botName || parsed.data.botId}" berhasil dihapus dari background engine.`,
+        deletedRunnerCount: ownedRunners.length,
+        cancellationFailures: cancellation.failures,
+        activeCount: Array.from(activeBotsRegistry.values()).filter((bot) => bot.uid === uid).length,
       });
     }
-    logAuditEvent(req, res, 'bot.deleted', { found: false });
+    logAuditEvent(req, res, 'bot.deleted', { uid, botId: parsed.data.botId, found: false });
     res.json({ success: true, message: 'Bot id tidak ditemukan atau sudah dibersihkan.' });
   } catch (err: any) {
     return next(err);
@@ -2601,16 +3573,25 @@ app.post('/api/bot/delete', (req: Request, res: Response, next) => {
 
 // API: Get background bot engine status & logs
 app.get('/api/bot/engine-status', (_req: Request, res: Response) => {
-  const botsList = Array.from(activeBotsRegistry.values()).map((b) => ({
+  const uid = res.locals.botUid as string;
+  const ownedBots = Array.from(activeBotsRegistry.values()).filter((bot) => bot.uid === uid);
+  const botsList = ownedBots.map((b) => ({
     id: b.id,
+    botId: b.botId,
+    runnerId: b.id,
     botName: b.botName,
     pair: b.pair,
-    mode: b.botMode,
+    mode: b.mode,
+    strategy: b.botMode,
     stepLayer: b.stepLayer,
     maxLayers: b.averagingLayers,
     entryPrice: b.entryPrice,
     lastPrice: b.lastEvaluatedPrice,
     status: b.status,
+    positionQty: b.positionQty,
+    avgEntryPrice: b.avgEntryPrice,
+    realizedPnlToday: b.realizedPnlToday,
+    lastErrorReason: b.lastErrorReason,
     minPrice: b.minPrice,
     maxPrice: b.maxPrice,
     priceBoundaryStatus: b.priceBoundaryStatus,
@@ -2623,28 +3604,42 @@ app.get('/api/bot/engine-status', (_req: Request, res: Response) => {
     activeBotsCount: botsList.filter((b) => b.status === 'active').length,
     totalRegisteredBots: botsList.length,
     bots: botsList,
-    recentLogs: botEngineLogs.slice(0, 15),
+    recentLogs: botEngineLogs.filter((log) => log.uid === uid).slice(0, 15),
   });
 });
 
-// API: Pause all bots in engine
-app.post('/api/bot/pause-all', (_req: Request, res: Response) => {
-  for (const bot of activeBotsRegistry.values()) {
-    bot.status = 'paused';
+// API: Pause only the authenticated user's bots
+app.post('/api/bot/pause-all', async (_req: Request, res: Response, next) => {
+  try {
+    const uid = res.locals.botUid as string;
+    const ownedBots = selectOwnedBotEntries(Array.from(activeBotsRegistry.entries()), uid).map(([, bot]) => bot);
+    ownedBots.forEach((bot) => { bot.status = 'paused'; });
+    await Promise.all(ownedBots.map(persistBotRunner));
+    logAuditEvent(_req, res, 'bot.engine.paused', { uid });
+    res.json({ success: true, message: 'Seluruh bot Anda berhasil dijeda.' });
+  } catch (error) {
+    next(error);
   }
-  isEngineRunning = false;
-  logAuditEvent(_req, res, 'bot.engine.paused');
-  res.json({ success: true, message: 'Seluruh bot di background engine berhasil dihentikan (Paused).' });
 });
 
-// API: Resume all bots in engine
-app.post('/api/bot/resume-all', (_req: Request, res: Response) => {
-  for (const bot of activeBotsRegistry.values()) {
-    bot.status = 'active';
+// API: Resume only the authenticated user's bots
+app.post('/api/bot/resume-all', async (_req: Request, res: Response, next) => {
+  try {
+    const uid = res.locals.botUid as string;
+    const ownedBots = selectOwnedBotEntries(Array.from(activeBotsRegistry.entries()), uid).map(([, bot]) => bot);
+    for (const bot of ownedBots) {
+      if (bot.pendingOrder || bot.resumeAfterReconciliation) continue;
+      bot.status = 'active';
+      bot.failureStreak = 0;
+      bot.priceFailureStreak = 0;
+      bot.lastErrorReason = undefined;
+    }
+    await Promise.all(ownedBots.map(persistBotRunner));
+    logAuditEvent(_req, res, 'bot.engine.resumed', { uid });
+    res.json({ success: true, message: 'Bot tanpa order ambigu berhasil dilanjutkan.' });
+  } catch (error) {
+    next(error);
   }
-  isEngineRunning = true;
-  logAuditEvent(_req, res, 'bot.engine.resumed');
-  res.json({ success: true, message: 'Seluruh bot di background engine berhasil diaktifkan kembali.' });
 });
 
 app.use('/api', (req: Request, _res: Response, next) => {
@@ -2653,12 +3648,24 @@ app.use('/api', (req: Request, _res: Response, next) => {
 
 // Boot server with Vite middleware
 async function startServer() {
+  try {
+    await restoreBotRunners();
+    persistenceReady = true;
+    persistenceFailureCode = undefined;
+  } catch (error) {
+    const errorCode = typeof (error as { code?: unknown })?.code === 'string'
+      ? String((error as { code: string }).code).slice(0, 64)
+      : 'BOT_STATE_RESTORE_FAILED';
+    persistenceFailureCode = errorCode;
+    console.error(JSON.stringify({ event: 'bot.state.restore_failed', errorCode }));
+  }
+
   if (process.env.NODE_ENV !== 'production') {
-    const vite = await createViteServer({
+    viteServer = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
     });
-    app.use(vite.middlewares);
+    app.use(viteServer.middlewares);
   } else {
     const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
@@ -2669,9 +3676,30 @@ async function startServer() {
 
   app.use(apiErrorHandler);
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`GAIN Server running at http://0.0.0.0:${PORT}`);
+  httpServer = app.listen(PORT, '0.0.0.0', () => {
+    console.log(`GAIN Server listening on 0.0.0.0:${PORT}; open http://localhost:${PORT}`);
+    if (persistenceReady) workerLoopTask = runBotWorkerLoop();
   });
 }
 
-startServer();
+let serverStopping = false;
+async function shutdownServer(): Promise<void> {
+  if (serverStopping) return;
+  serverStopping = true;
+  shutdownRequested = true;
+  if (httpServer) {
+    await new Promise<void>((resolve) => httpServer?.close(() => resolve()));
+  }
+  await workerLoopTask;
+  await Promise.allSettled(Array.from(activeBotsRegistry.values()).map(persistBotRunner));
+  await Promise.allSettled(Array.from(activeBotsRegistry.values()).map(releaseBotLease));
+  await viteServer?.close();
+}
+
+process.once('SIGTERM', () => { void shutdownServer(); });
+process.once('SIGINT', () => { void shutdownServer(); });
+
+startServer().catch(() => {
+  console.error(JSON.stringify({ event: 'server.start_failed' }));
+  process.exitCode = 1;
+});

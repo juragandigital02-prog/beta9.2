@@ -57,7 +57,19 @@ Dokumen ini berfungsi sebagai checklist smoke test sebelum release production GA
 
 ## 5. Exchange & bot smoke test
 
+- [ ] `npm test` lulus seluruh unit dan mock-exchange test.
+- [ ] Jalankan `BASE_URL=https://<staging-domain> npm run smoke:bot-auth`; semua route bot tanpa token harus mengembalikan 401.
 - [ ] exchange API key valid.
+- [ ] exchange API key has Spot permissions only, withdrawal permission disabled, and exchange-side IP whitelist configured.
+- [ ] server has Firebase Admin ADC with least-privilege Firestore access and `ENCRYPTION_MASTER_KEY` injected from a secret manager.
+- [ ] `LIVE_TRADING_ENABLED=false` remains the production default until testnet signoff; paper runner is used for initial validation.
+- [ ] missing/invalid Firebase ID token receives 401 on every `/api/bot/*` route.
+- [ ] user A cannot see, pause, delete, or kill-switch user B's bot.
+- [ ] stale ticker skips a cycle and never submits an order.
+- [ ] take-profit confirms a paper SELL; live SELL is tested on exchange testnet before enablement.
+- [ ] order errors transition the runner to `error` or `paused` and are not logged as successful fills.
+- [ ] restart restores Firestore state; ambiguous pending order remains paused and is not resubmitted.
+- [ ] logout's default action pauses bots and cancels open orders; cancellation failure retains credentials and runner state.
 - [ ] kelebihan rate limit dikembalikan dengan 429.
 - [ ] exchange cooldown menghasilkan error yang aman dan bukan leak secret.
 - [ ] bot execution tidak memblokir API utama.
@@ -69,6 +81,8 @@ Dokumen ini berfungsi sebagai checklist smoke test sebelum release production GA
 ## 6. Observability & monitoring
 
 - [ ] `/api/health` returns 200.
+- [ ] `/healthz` returns liveness and `/readyz` returns 200 only after Firestore state restore.
+- [ ] health metrics show bot status counts, order error rate, ticker latency, and ticker age.
 - [ ] request metrics menampilkan total, failures, slow request.
 - [ ] 5xx rate dapat dilihat di log.
 - [ ] exchange failure tercatat dengan requestId dan status.

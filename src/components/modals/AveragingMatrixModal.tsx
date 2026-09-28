@@ -45,11 +45,13 @@ interface AveragingMatrixModalProps {
   existingBotsForCoin?: TradingPosition[];
   allPositions?: TradingPosition[];
   availableBalance?: number;
+  isTestnetConnected?: boolean;
   onOpenSimulation?: () => void;
   onDeployBot?: (config: {
     botId?: string;
     botName?: string;
     isNewBot?: boolean;
+    executionMode: 'paper' | 'live';
     pair: string;
     pairedCoins: string[];
     botMode: BotMode;
@@ -86,6 +88,7 @@ export function AveragingMatrixModal({
   existingBotsForCoin = [],
   allPositions = [],
   availableBalance = 70.0,
+  isTestnetConnected = false,
   onOpenSimulation,
   onDeployBot,
 }: AveragingMatrixModalProps) {
@@ -96,6 +99,7 @@ export function AveragingMatrixModal({
   const [isCreatingNewBot, setIsCreatingNewBot] = useState<boolean>(isNewBot ?? (!initialBotId));
   const [botNameInput, setBotNameInput] = useState<string>(initialBotName || '');
   const [botMode, setBotMode] = useState<BotMode>(initialMode);
+  const [executionMode, setExecutionMode] = useState<'paper' | 'live'>('paper');
 
   // =========================================================================
   // 2. MULTI-COIN PAIRING SELECTION (1 Bot Bisa Dengan Banyak Koin)
@@ -137,6 +141,7 @@ export function AveragingMatrixModal({
   // Initialize or re-sync when modal opens
   useEffect(() => {
     if (isOpen) {
+      setExecutionMode('paper');
       // Setup paired coins
       if (selectedPairs && selectedPairs.length > 0) {
         setPairedCoins(selectedPairs);
@@ -496,6 +501,7 @@ export function AveragingMatrixModal({
         botId: isCreatingNewBot ? undefined : (activeBotId || undefined),
         botName: defaultName,
         isNewBot: isCreatingNewBot,
+        executionMode,
         pair: primaryPair,
         pairedCoins, // All coins selected for this 1 bot!
         botMode,
@@ -904,6 +910,41 @@ export function AveragingMatrixModal({
                     />
                   </button>
                 </div>
+              </div>
+
+              <div className="rounded-xl border border-slate-200 bg-slate-50 p-3 dark:border-[#152338] dark:bg-[#070D18]">
+                <label className="mb-2 block text-[10px] font-mono font-bold uppercase text-slate-500 dark:text-slate-400">
+                  Mode Eksekusi
+                </label>
+                <div className="grid grid-cols-2 gap-2" role="group" aria-label="Mode eksekusi bot">
+                  <button
+                    type="button"
+                    aria-pressed={executionMode === 'paper'}
+                    onClick={() => setExecutionMode('paper')}
+                    className={`rounded-lg border px-3 py-2 text-xs font-semibold transition ${executionMode === 'paper'
+                      ? 'border-teal-500 bg-teal-500/15 text-teal-700 dark:text-teal-300'
+                      : 'border-slate-200 bg-white text-slate-600 dark:border-[#1A2E4C] dark:bg-[#0C1525] dark:text-slate-400'}`}
+                  >
+                    Paper
+                  </button>
+                  <button
+                    type="button"
+                    aria-pressed={executionMode === 'live'}
+                    disabled={!isTestnetConnected}
+                    onClick={() => setExecutionMode('live')}
+                    className={`rounded-lg border px-3 py-2 text-xs font-semibold transition disabled:cursor-not-allowed disabled:opacity-40 ${executionMode === 'live'
+                      ? 'border-amber-500 bg-amber-500/15 text-amber-700 dark:text-amber-300'
+                      : 'border-slate-200 bg-white text-slate-600 dark:border-[#1A2E4C] dark:bg-[#0C1525] dark:text-slate-400'}`}
+                  >
+                    Live Testnet
+                  </button>
+                </div>
+                <p className="mt-2 text-[10px] leading-relaxed text-slate-500 dark:text-slate-400">
+                  {executionMode === 'paper'
+                    ? 'Simulasi tanpa mengirim order ke exchange.'
+                    : 'Order nyata hanya ke API sandbox yang sedang tersambung. Server LIVE_TRADING_ENABLED tetap harus aktif.'}
+                  {!isTestnetConnected && ' Hubungkan API exchange dalam mode Testnet untuk membuka pilihan ini.'}
+                </p>
               </div>
             </div>
 

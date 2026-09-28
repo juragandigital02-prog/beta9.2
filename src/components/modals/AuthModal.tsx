@@ -20,6 +20,7 @@ import {
 } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
 import { lookupMemberInDirectory } from '../../services/memberService';
+import { isDemoMode } from '../../config/appMode';
 import { GainLogo } from '../common/GainLogo';
 
 interface AuthModalProps {
@@ -55,7 +56,12 @@ export function AuthModal({
   const [isVerifyingSponsor, setIsVerifyingSponsor] = useState(false);
   const [sponsorStatus, setSponsorStatus] = useState<'valid' | 'invalid' | 'default'>('valid');
 
-  const currentHost = typeof window !== 'undefined' ? window.location.hostname : 'ais-dev-3vain7eqwygwk4lx5gipea-684712923867.asia-east1.run.app';
+  const currentHost = typeof window !== 'undefined' ? window.location.hostname : 'localhost';
+  const isWildcardBindHost = currentHost === '0.0.0.0';
+  const authorizedHost = isWildcardBindHost ? 'localhost' : currentHost;
+  const localhostUrl = typeof window !== 'undefined'
+    ? `${window.location.protocol}//localhost${window.location.port ? `:${window.location.port}` : ''}`
+    : 'http://localhost:3000';
 
   useEffect(() => {
     setActiveTab(defaultMode);
@@ -123,8 +129,8 @@ export function AuthModal({
 
   if (!isOpen) return null;
 
-  const handleRegisterSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const handleRegisterSubmit = async (e?: React.FormEvent) => {
+    e?.preventDefault();
     if (sponsorStatus === 'invalid') return;
 
     await loginWithGoogle({
@@ -209,7 +215,9 @@ export function AuthModal({
                   Domain Belum Diizinkan di Firebase Console
                 </h4>
                 <p className="text-[11px] text-slate-300 leading-relaxed font-sans">
-                  Firebase Authentication membatasi Google Sign-In hanya pada domain yang terdaftar. Tambahkan domain ini ke <strong>Authorized Domains</strong> di Firebase Authentication Settings:
+                  {isWildcardBindHost
+                    ? 'Aplikasi dibuka melalui alamat bind server 0.0.0.0. Buka localhost di browser; alamat 0.0.0.0 tidak perlu dan tidak sebaiknya ditambahkan ke Authorized Domains.'
+                    : <>Firebase Authentication membatasi Google Sign-In hanya pada domain yang terdaftar. Pastikan hostname ini tercantum di <strong>Authorized Domains</strong> di Firebase Authentication Settings:</>}
                 </p>
               </div>
             </div>
@@ -219,7 +227,7 @@ export function AuthModal({
               <div className="overflow-hidden">
                 <span className="text-[9px] text-slate-500 block uppercase">Domain Saat Ini (Salin ini):</span>
                 <code className="text-[11px] text-[#00F0C8] font-bold break-all select-all font-mono">
-                  {currentHost}
+                  {authorizedHost}
                 </code>
               </div>
               <button
@@ -232,20 +240,14 @@ export function AuthModal({
               </button>
             </div>
 
-            {/* Solusi Alternatif / Instan */}
-            <div className="p-2.5 rounded-xl bg-teal-950/40 border border-teal-500/30 text-[11px] text-teal-200 font-sans">
-              <p className="font-bold text-[#00F0C8] mb-1 font-mono text-[10px] uppercase">⚡ Solusi Instan (Tanpa Setting Firebase):</p>
-              <p className="text-slate-300 leading-relaxed">
-                Anda dapat langsung masuk atau daftar menggunakan <strong>Email Cepat</strong> di bawah tanpa perlu otorisasi Google Popup, atau tambahkan domain wildcard <code className="text-[#00F0C8] font-mono">run.app</code> di Firebase Console agar berlaku otomatis untuk semua URL AI Studio.
-              </p>
-            </div>
-
             {/* Quick 3-Step Guide */}
             <div className="text-[11px] text-slate-300 space-y-1.5 font-sans bg-black/40 p-3 rounded-xl border border-white/5">
               <p className="font-bold text-amber-400 font-mono text-[10px] uppercase">Cara Menambahkan ke Firebase Console:</p>
               <ol className="list-decimal pl-4 space-y-1 text-[11px] text-slate-300 leading-relaxed">
                 <li>Buka <strong>Firebase Console &rarr; Authentication &rarr; Settings &rarr; Authorized domains</strong>.</li>
-                <li>Klik <strong>Add domain</strong>, masukkan <code className="text-[#00F0C8] bg-black/50 px-1 py-0.5 rounded font-mono">run.app</code> atau <code className="text-[#00F0C8] bg-black/50 px-1 py-0.5 rounded font-mono">{currentHost}</code> &rarr; <strong>Save</strong>.</li>
+                <li>{isWildcardBindHost
+                  ? <>Buka aplikasi menggunakan <code className="text-[#00F0C8] bg-black/50 px-1 py-0.5 rounded font-mono">localhost</code>; jangan tambahkan <code className="text-[#00F0C8] bg-black/50 px-1 py-0.5 rounded font-mono">0.0.0.0</code>.</>
+                  : <>Pastikan hostname <code className="text-[#00F0C8] bg-black/50 px-1 py-0.5 rounded font-mono">{authorizedHost}</code> tercantum; tambahkan jika belum ada.</>}</li>
                 <li>Setelah disimpan, klik tombol <strong>"Coba Masuk Lagi"</strong> di bawah.</li>
               </ol>
             </div>
@@ -253,23 +255,27 @@ export function AuthModal({
             {/* Action Buttons */}
             <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 pt-1 font-mono">
               <a
-                href={`https://console.firebase.google.com/project/${import.meta.env.VITE_FIREBASE_PROJECT_ID || 'gain-niagakoin-prod'}/authentication/settings`}
+                href={isWildcardBindHost
+                  ? localhostUrl
+                  : `https://console.firebase.google.com/project/${import.meta.env.VITE_FIREBASE_PROJECT_ID || 'gain-niagakoin-prod'}/authentication/settings`}
                 target="_blank"
                 rel="noopener noreferrer"
                 className="flex-1 py-2.5 px-3 rounded-xl bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40 text-center font-bold text-[11px] transition flex items-center justify-center gap-1.5"
               >
-                <span>Buka Authorized Domains di Console</span>
+                <span>{isWildcardBindHost ? 'Buka aplikasi di localhost' : 'Buka Authorized Domains di Console'}</span>
                 <ExternalLink className="w-3.5 h-3.5" />
               </a>
-              <button
-                type="button"
-                onClick={activeTab === 'login' ? handleLoginSubmit : handleRegisterSubmit}
-                disabled={isLoggingIn}
-                className="py-2.5 px-3 rounded-xl bg-[#00F0C8]/20 hover:bg-[#00F0C8]/30 text-[#00F0C8] border border-[#00F0C8]/40 font-bold text-[11px] transition flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-50"
-              >
-                <RefreshCw className={`w-3.5 h-3.5 ${isLoggingIn ? 'animate-spin' : ''}`} />
-                <span>Coba Masuk Lagi</span>
-              </button>
+              {!isWildcardBindHost && (
+                <button
+                  type="button"
+                  onClick={activeTab === 'login' ? handleLoginSubmit : () => handleRegisterSubmit()}
+                  disabled={isLoggingIn}
+                  className="py-2.5 px-3 rounded-xl bg-[#00F0C8]/20 hover:bg-[#00F0C8]/30 text-[#00F0C8] border border-[#00F0C8]/40 font-bold text-[11px] transition flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-50"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${isLoggingIn ? 'animate-spin' : ''}`} />
+                  <span>Coba Masuk Lagi</span>
+                </button>
+              )}
             </div>
           </div>
         )}
@@ -382,11 +388,11 @@ export function AuthModal({
               <span>{isLoggingIn ? 'Menghubungkan Akun...' : 'Masuk dengan Akun Google'}</span>
             </button>
 
-            {/* Quick Email Direct Login (Fallback) */}
-            <div className="pt-2 border-t border-slate-800/80 dark:border-[#14233A]">
-              <span className="text-[10px] text-slate-400 font-sans block mb-1.5">
-                Atau masuk cepat dengan email:
-              </span>
+            {isDemoMode && (
+              <div className="pt-2 border-t border-slate-800/80 dark:border-[#14233A]">
+                <span className="text-[10px] text-amber-300 font-sans block mb-1.5">
+                  Login demo lokal saja; sesi dan data ini tidak disinkronkan ke Firebase.
+                </span>
               <div className="flex gap-2">
                 <input
                   type="email"
@@ -401,10 +407,11 @@ export function AuthModal({
                   disabled={!directEmail.trim() || isLoggingIn}
                   className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-[#00F0C8] font-sans font-bold text-xs border border-slate-700 disabled:opacity-40 cursor-pointer"
                 >
-                  Masuk
+                  Demo
                 </button>
               </div>
-            </div>
+              </div>
+            )}
 
             <div className="text-center pt-1">
               <p className="text-xs text-slate-400">
@@ -516,7 +523,7 @@ export function AuthModal({
                 <span>Memproses Registrasi...</span>
               ) : (
                 <>
-                  <span>Daftar & Masuk Sekarang</span>
+                  <span>Daftar dengan Akun Google</span>
                   <ArrowRight className="w-4 h-4" />
                 </>
               )}

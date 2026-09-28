@@ -169,6 +169,37 @@ Setelah recovery:
 
 ## 6. Incident Classification
 
+### Bot trading operations
+
+- Keep `LIVE_TRADING_ENABLED=false` until paper and exchange testnet checks pass. Live mode also requires an explicit `mode: "live"` bot registration.
+- Exchange credentials must have Spot trading permission only, withdrawal disabled, and exchange-side IP whitelist restricted to production egress addresses.
+- Inject Firebase Admin ADC and a random 32-byte `ENCRYPTION_MASTER_KEY` through the deployment secret manager. Do not put either in source control or logs. Back up the encryption key separately; encrypted credentials cannot be recovered without it.
+- For a sandbox exercise, set `LIVE_TRADING_ENABLED=true` and keep `LIVE_TRADING_TESTNET_ONLY=true`; the server rejects live-mode bot registration with non-sandbox credentials while this guard is enabled.
+- Configure `CORS_ALLOWED_ORIGINS` with exact HTTPS origins. Do not use `*`.
+- Before release, run `npm test` and `BASE_URL=https://<staging-domain> npm run smoke:bot-auth`; test with two authenticated Firebase users and exchange testnet remains a separate required signoff.
+- Check `/healthz` for process liveness, `/readyz` for Firestore restore readiness, and `/api/health` for bot/order/ticker metrics.
+
+#### Bot enters `error` or `paused`
+
+1. Read the bot status and safe `lastErrorReason`; do not retry with new credentials in a URL or log.
+2. Verify exchange permissions, symbol, available balance, market minimums, price freshness, and risk limits.
+3. Inspect open orders at the exchange. Keep the bot paused until exchange state matches the recorded position.
+4. Correct the cause, then explicitly resume. An uncertain pending order is never automatically resubmitted.
+
+#### Exchange unavailable or cancel cannot be confirmed
+
+1. Keep live trading disabled or invoke the per-user kill-switch while authenticated.
+2. A cancellation failure intentionally retains encrypted credentials and paused runner records so operators can retry cancellation after exchange recovery.
+3. Verify open orders directly at the exchange before deleting the runner or disconnecting credentials.
+4. Check `/api/health` ticker age, order error rate, and structured logs using the request ID.
+
+#### Rollback
+
+1. Set `LIVE_TRADING_ENABLED=false` and deploy the last known-good server build.
+2. Do not delete Firestore `botRunners`, `botOrders`, `botCredentials`, or `botLocks` during rollback.
+3. Verify `/readyz`, inspect open orders and balances, and keep restored live bots paused until reconciliation succeeds.
+4. Re-enable live only after testnet and the production smoke checklist pass.
+
 ### Sev-1
 - data loss / financial corruption
 - auth compromise

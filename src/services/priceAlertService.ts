@@ -8,6 +8,7 @@ import {
 } from 'firebase/firestore';
 import { db, auth } from '../firebase';
 import { PriceAlert } from '../types';
+import { isDemoMode } from '../config/appMode';
 import { sendBrowserNotification, playAlertChime } from './notificationService';
 import { formatUsdt } from '../utils/formatters';
 
@@ -45,8 +46,12 @@ export function subscribeToPriceAlerts(
   userId: string | null | undefined,
   onUpdate: (alerts: PriceAlert[]) => void
 ): () => void {
-  if (!userId) {
+  if (isDemoMode && (!userId || auth.currentUser?.uid !== userId)) {
     onUpdate(getLocalPriceAlerts());
+    return () => {};
+  }
+  if (!userId || auth.currentUser?.uid !== userId) {
+    onUpdate([]);
     return () => {};
   }
 
@@ -63,10 +68,20 @@ export function subscribeToPriceAlerts(
       onUpdate(alerts);
     },
     (err) => {
-      console.warn('Firestore price_alerts subscription fallback to local cache:', err);
-      onUpdate(getLocalPriceAlerts());
+      console.error('[PRICE_ALERT_SUBSCRIPTION_FAILED]', err);
+      onUpdate([]);
     }
   );
+}
+
+function useLocalDemoAlerts(userId: string | null | undefined): boolean {
+  return isDemoMode && (!userId || auth.currentUser?.uid !== userId);
+}
+
+function requireFirebaseUser(userId: string | null | undefined): asserts userId is string {
+  if (!userId || !auth.currentUser || auth.currentUser.uid !== userId) {
+    throw new Error('Login Firebase diperlukan untuk menyimpan Price Alert ke cloud.');
+  }
 }
 
 /**
@@ -76,17 +91,17 @@ export async function savePriceAlert(
   userId: string | null | undefined,
   alert: PriceAlert
 ): Promise<void> {
-  const currentLocal = getLocalPriceAlerts().filter((a) => a.id !== alert.id);
-  setLocalPriceAlerts([alert, ...currentLocal]);
-
-  if (userId) {
-    try {
-      const alertRef = doc(db, 'users', userId, 'price_alerts', alert.id);
-      await setDoc(alertRef, { ...alert, userId }, { merge: true });
-    } catch (e) {
-      console.warn('Failed to save price alert to Firestore, saved to local cache:', e);
-    }
+  if (useLocalDemoAlerts(userId)) {
+    const currentLocal = getLocalPriceAlerts().filter((item) => item.id !== alert.id);
+    setLocalPriceAlerts([alert, ...currentLocal]);
+    return;
   }
+
+  requireFirebaseUser(userId);
+  const alertRef = doc(db, 'users', userId, 'price_alerts', alert.id);
+  await setDoc(alertRef, { ...alert, userId }, { merge: true });
+  const currentLocal = getLocalPriceAlerts().filter((item) => item.id !== alert.id);
+  setLocalPriceAlerts([alert, ...currentLocal]);
 }
 
 /**
@@ -96,17 +111,15 @@ export async function deletePriceAlert(
   userId: string | null | undefined,
   alertId: string
 ): Promise<void> {
-  const currentLocal = getLocalPriceAlerts().filter((a) => a.id !== alertId);
-  setLocalPriceAlerts(currentLocal);
-
-  if (userId) {
-    try {
-      const alertRef = doc(db, 'users', userId, 'price_alerts', alertId);
-      await deleteDoc(alertRef);
-    } catch (e) {
-      console.warn('Failed to delete price alert from Firestore:', e);
-    }
+  if (useLocalDemoAlerts(userId)) {
+    setLocalPriceAlerts(getLocalPriceAlerts().filter((alert) => alert.id !== alertId));
+    return;
   }
+
+  requireFirebaseUser(userId);
+  const alertRef = doc(db, 'users', userId, 'price_alerts', alertId);
+  await deleteDoc(alertRef);
+  setLocalPriceAlerts(getLocalPriceAlerts().filter((alert) => alert.id !== alertId));
 }
 
 /**
@@ -117,19 +130,19 @@ export async function updatePriceAlert(
   alertId: string,
   updates: Partial<PriceAlert>
 ): Promise<void> {
-  const currentLocal = getLocalPriceAlerts().map((a) =>
-    a.id === alertId ? { ...a, ...updates } : a
-  );
-  setLocalPriceAlerts(currentLocal);
-
-  if (userId) {
-    try {
-      const alertRef = doc(db, 'users', userId, 'price_alerts', alertId);
-      await updateDoc(alertRef, { ...updates, userId });
-    } catch (e) {
-      console.warn('Failed to update price alert in Firestore:', e);
-    }
+  if (useLocalDemoAlerts(userId)) {
+    setLocalPriceAlerts(getLocalPriceAlerts().map((alert) =>
+      alert.id === alertId ? { ...alert, ...updates } : alert
+    ));
+    return;
   }
+
+  requireFirebaseUser(userId);
+  const alertRef = doc(db, 'users', userId, 'price_alerts', alertId);
+  await updateDoc(alertRef, { ...updates, userId });
+  setLocalPriceAlerts(getLocalPriceAlerts().map((alert) =>
+    alert.id === alertId ? { ...alert, ...updates } : alert
+  ));
 }
 
 /**
@@ -191,7 +204,7 @@ export function checkPriceAlerts(
         triggeredAt,
         triggeredPrice: currentPrice,
         notificationSent: true,
-      });
+      }).catch((error) => console.error('[PRICE_ALERT_UPDATE_FAILED]', error));
 
       return updated;
     }

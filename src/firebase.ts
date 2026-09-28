@@ -20,9 +20,9 @@ export const activeFirebaseConfig = {
 
 const app = getApps().length > 0 ? getApp() : initializeApp(activeFirebaseConfig);
 
-// If custom project is used and databaseId is default or not specified, use standard default database.
+// An empty value or `(default)` selects Firestore's standard database; other IDs are used verbatim.
 const rawDbId = import.meta.env.VITE_FIREBASE_DATABASE_ID;
-const customDbId = (!rawDbId || rawDbId === 'default' || rawDbId === '(default)') ? undefined : rawDbId;
+const customDbId = !rawDbId || rawDbId === '(default)' ? undefined : rawDbId;
 export const db = isCustomConfig
   ? (customDbId ? getFirestore(app, customDbId) : getFirestore(app))
   : getFirestore(app, defaultConfig.firestoreDatabaseId);
@@ -102,8 +102,10 @@ export async function testFirestoreConnection() {
   try {
     await getDocFromServer(doc(db, 'test', 'connection'));
   } catch (error) {
-    if (error instanceof Error && error.message.includes('the client is offline')) {
-      console.error('Please check your Firebase configuration.');
-    }
+    const code = (error as { code?: unknown })?.code;
+    console.error('[FIREBASE_CONNECTION_FAILED]', {
+      code: typeof code === 'string' ? code : 'firestore/unknown',
+    });
+    throw error;
   }
 }

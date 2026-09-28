@@ -4,6 +4,10 @@ import { auth, signInWithGoogle, signOutUser, testFirestoreConnection } from '..
 import { initUserProfile } from '../repositories/userRepository';
 import { resolveCurrentUserRole } from '../utils/roles';
 import { reportClientEvent } from '../services/observabilityService';
+import { isDemoMode } from '../config/appMode';
+import { activateBotKillSwitch } from '../api/botApi';
+
+type FirebaseConnectionStatus = 'checking' | 'connected' | 'error';
 
 interface AuthContextType {
   currentUser: User | null;
@@ -12,7 +16,7 @@ interface AuthContextType {
   loginDirectly: (email: string, registrationData?: { sponsorId?: string; sponsorName?: string; desiredUsername?: string }) => Promise<void>;
   retryUserProfileSync: () => Promise<void>;
   logout: () => Promise<void>;
-  isFirebaseConnected: boolean;
+  firebaseConnectionStatus: FirebaseConnectionStatus;
   isLoggingIn: boolean;
   isAdmin: boolean;
   isAuthModalOpen: boolean;
@@ -41,7 +45,7 @@ const AuthContext = createContext<AuthContextType>({
   loginDirectly: async () => {},
   retryUserProfileSync: async () => {},
   logout: async () => {},
-  isFirebaseConnected: false,
+  firebaseConnectionStatus: 'checking',
   isLoggingIn: false,
   isAdmin: false,
   isAuthModalOpen: false,
@@ -64,7 +68,7 @@ const AuthContext = createContext<AuthContextType>({
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
-  const [isFirebaseConnected, setIsFirebaseConnected] = useState(false);
+  const [firebaseConnectionStatus, setFirebaseConnectionStatus] = useState<FirebaseConnectionStatus>('checking');
   const [isLoggingIn, setIsLoggingIn] = useState(false);
   const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
   const [authModalMode, setAuthModalMode] = useState<'login' | 'register'>('login');
@@ -126,29 +130,52 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, [currentUser]);
 
   useEffect(() => {
-    // Restore a saved user session without treating the guest preview as an account.
+    // Only restore local demo sessions; production sessions are owned by Firebase Auth.
     let activeUser: any = null;
     if (typeof window !== 'undefined') {
-      const savedUserRaw = localStorage.getItem('gain_saved_user');
+      const savedUserRaw = isDemoMode ? localStorage.getItem('gain_saved_user') : null;
       if (savedUserRaw) {
         try {
           const parsed = JSON.parse(savedUserRaw);
-          if (parsed?.uid) {
+          if (parsed?.uid && parsed.uid !== 'gain-usr-demo') {
             activeUser = parsed;
           }
         } catch {}
       }
-      if (activeUser?.uid === 'gain-usr-demo') {
-        activeUser = null;
+      if (!isDemoMode) {
+        try {
+          const savedUser = JSON.parse(localStorage.getItem('gain_saved_user') || 'null');
+          if (typeof savedUser?.uid === 'string' && savedUser.uid.startsWith('gain-usr-')) {
+            localStorage.removeItem('gain_saved_user');
+            localStorage.removeItem('gain_session_timestamp');
+          }
+        } catch {
+          localStorage.removeItem('gain_saved_user');
+          localStorage.removeItem('gain_session_timestamp');
+        }
+      }
+      if (isDemoMode && !activeUser) {
         localStorage.removeItem('gain_saved_user');
       }
       setCurrentUser(activeUser);
       if (activeUser) initUserProfile(activeUser).catch(() => {});
     }
 
-    testFirestoreConnection()
-      .then(() => setIsFirebaseConnected(true))
-      .catch(() => setIsFirebaseConnected(false));
+    let connectionCheckActive = true;
+    const checkFirebaseConnection = () => {
+      void testFirestoreConnection()
+        .then(() => {
+          if (connectionCheckActive) setFirebaseConnectionStatus('connected');
+        })
+        .catch(() => {
+          if (connectionCheckActive) setFirebaseConnectionStatus('error');
+        });
+    };
+    const handleBrowserOffline = () => setFirebaseConnectionStatus('error');
+
+    checkFirebaseConnection();
+    window.addEventListener('online', checkFirebaseConnection);
+    window.addEventListener('offline', handleBrowserOffline);
 
     const unsubscribe = onAuthStateChanged(auth, async (user) => {
       if (user) {
@@ -172,7 +199,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setLoading(false);
     });
 
-    return () => unsubscribe();
+      return () => {
+        connectionCheckActive = false;
+        window.removeEventListener('online', checkFirebaseConnection);
+        window.removeEventListener('offline', handleBrowserOffline);
+        unsubscribe();
+      };
   }, []);
 
   const loginWithGoogle = async (registrationData?: { sponsorId?: string; sponsorName?: string; desiredUsername?: string }) => {
@@ -206,6 +238,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   };
 
   const loginDirectly = async (email: string, registrationData?: { sponsorId?: string; sponsorName?: string; desiredUsername?: string }) => {
+    if (!isDemoMode) {
+      setAuthError({
+        code: 'auth/demo-login-disabled',
+        message: 'Login email hanya tersedia dalam mode demo. Gunakan Google Sign-In untuk akun Firebase dan sinkronisasi cloud.',
+      });
+      return;
+    }
+
     setIsLoggingIn(true);
     setAuthError(null);
     try {
@@ -243,6 +283,16 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const logout = async () => {
     try {
+      const firebaseUser = auth.currentUser;
+      const shouldStopBots = typeof window === 'undefined' || window.confirm(
+        'Logout sekarang? Pilih OK untuk menjeda semua bot dan membatalkan open order. Pilih Cancel untuk membiarkan bot tetap berjalan.'
+      );
+      if (firebaseUser && currentUser?.uid === firebaseUser.uid && shouldStopBots) {
+        const killSwitchResult = await activateBotKillSwitch();
+        if (Number(killSwitchResult.cancellationFailures) > 0) {
+          throw new Error('Bot sudah dijeda, tetapi sebagian open order belum dapat dikonfirmasi batal. Anda tetap login agar dapat memeriksa status bot.');
+        }
+      }
       await signOutUser();
       reportClientEvent('auth.logout.success');
       if (typeof window !== 'undefined') {
@@ -258,6 +308,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       const code = typeof err?.code === 'string' ? err.code : 'auth/logout-error';
       console.error('[AUTH_LOGOUT_FAILED]', { code });
       reportClientEvent('auth.logout.failed', { errorCode: code });
+      setAuthError({ code, message: err?.message || 'Logout gagal. Sesi tetap aktif.' });
     }
   };
 
@@ -296,7 +347,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         loginDirectly,
         retryUserProfileSync,
         logout,
-        isFirebaseConnected,
+        firebaseConnectionStatus,
         isLoggingIn,
         isAdmin,
         isAuthModalOpen,

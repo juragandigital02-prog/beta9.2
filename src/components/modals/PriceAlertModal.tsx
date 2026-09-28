@@ -68,6 +68,7 @@ export function PriceAlertModal({
   const [isRepeating, setIsRepeating] = useState<boolean>(false);
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
   const [successToast, setSuccessToast] = useState<string | null>(null);
+  const [operationError, setOperationError] = useState<string | null>(null);
   const [searchCoinQuery, setSearchCoinQuery] = useState<string>('');
   const [showCoinDropdown, setShowCoinDropdown] = useState<boolean>(false);
 
@@ -170,6 +171,7 @@ export function PriceAlertModal({
     if (!targetPriceNum || targetPriceNum <= 0) return;
 
     setIsSubmitting(true);
+    setOperationError(null);
     try {
       const cleanCoin = selectedPair.split('/')[0];
       const newAlert: PriceAlert = {
@@ -196,31 +198,48 @@ export function PriceAlertModal({
       setSuccessToast(`Alert untuk ${selectedPair} sebesar $${formatUsdt(targetPriceNum)} berhasil dipasang!`);
       setTimeout(() => setSuccessToast(null), 3000);
       setActiveTab('list');
+    } catch (error) {
+      setOperationError(error instanceof Error ? error.message : 'Gagal menyimpan Price Alert ke Firestore.');
     } finally {
       setIsSubmitting(false);
     }
   };
 
   const handleDelete = async (alertId: string) => {
-    await deletePriceAlert(userId, alertId);
+    setOperationError(null);
+    try {
+      await deletePriceAlert(userId, alertId);
+    } catch (error) {
+      setOperationError(error instanceof Error ? error.message : 'Gagal menghapus Price Alert dari Firestore.');
+    }
   };
 
   const handleToggleStatus = async (alert: PriceAlert) => {
     const nextStatus = alert.status === 'active' ? 'disabled' : 'active';
-    await updatePriceAlert(userId, alert.id, {
-      status: nextStatus,
-      notificationSent: false,
-    });
+    setOperationError(null);
+    try {
+      await updatePriceAlert(userId, alert.id, {
+        status: nextStatus,
+        notificationSent: false,
+      });
+    } catch (error) {
+      setOperationError(error instanceof Error ? error.message : 'Gagal memperbarui Price Alert di Firestore.');
+    }
   };
 
   const handleReactivate = async (alert: PriceAlert) => {
-    await updatePriceAlert(userId, alert.id, {
-      status: 'active',
-      notificationSent: false,
-      initialPrice: currentPrices[alert.symbol] || alert.initialPrice,
-    });
-    setSuccessToast(`Alert ${alert.symbol} diaktifkan kembali!`);
-    setTimeout(() => setSuccessToast(null), 3000);
+    setOperationError(null);
+    try {
+      await updatePriceAlert(userId, alert.id, {
+        status: 'active',
+        notificationSent: false,
+        initialPrice: currentPrices[alert.symbol] || alert.initialPrice,
+      });
+      setSuccessToast(`Alert ${alert.symbol} diaktifkan kembali!`);
+      setTimeout(() => setSuccessToast(null), 3000);
+    } catch (error) {
+      setOperationError(error instanceof Error ? error.message : 'Gagal memperbarui Price Alert di Firestore.');
+    }
   };
 
   // Filtered lists
@@ -323,6 +342,12 @@ export function PriceAlertModal({
           <div className="mx-4 sm:mx-5 mt-3 p-2.5 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-600 dark:text-emerald-400 text-xs font-sans flex items-center gap-2 animate-in fade-in">
             <CheckCircle2 className="w-4 h-4 shrink-0" />
             <span className="font-medium">{successToast}</span>
+          </div>
+        )}
+        {operationError && (
+          <div className="mx-4 sm:mx-5 mt-3 p-2.5 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-600 dark:text-rose-400 text-xs font-sans flex items-center gap-2 animate-in fade-in">
+            <AlertCircle className="w-4 h-4 shrink-0" />
+            <span className="font-medium">{operationError}</span>
           </div>
         )}
 

@@ -82,8 +82,6 @@ export const TradeHistoryTab: React.FC<TradeHistoryTabProps> = ({
   // Accordion state for pair cards
   const [collapsedPairs, setCollapsedPairs] = useState<Record<string, boolean>>({});
 
-  // Sell Confirmation Modal State
-  const [sellModalPos, setSellModalPos] = useState<TradingPosition | null>(null);
   const [isSelling, setIsSelling] = useState(false);
   const [sellToast, setSellToast] = useState<{ title: string; message: string; isError?: boolean } | null>(null);
 
@@ -155,6 +153,39 @@ export const TradeHistoryTab: React.FC<TradeHistoryTabProps> = ({
     navigator.clipboard.writeText(textToCopy);
     setCopiedId(id);
     setTimeout(() => setCopiedId(null), 2000);
+  };
+
+  const handleForceSell = async (position: TradingPosition) => {
+    if (!onForceTakeProfit || isSelling) return;
+    setIsSelling(true);
+    setSellToast(null);
+    try {
+      const result = await onForceTakeProfit(position.id);
+      if (!result?.success) {
+        setSellToast({
+          title: 'Sell belum berhasil',
+          message: result?.error || 'Order tidak terkonfirmasi. Periksa status exchange sebelum mencoba lagi.',
+          isError: true,
+        });
+        return;
+      }
+
+      setSellToast({
+        title: result.partial ? 'Sell terisi sebagian' : 'Sell berhasil',
+        message: result.persistenceWarning || (result.partial
+          ? `Terjual ${Number(result.filledAmount || 0).toFixed(8)} ${position.coin}; sisa ${Number(result.remainingAmount || 0).toFixed(8)} ${position.coin} tetap aktif.`
+          : `Posisi ${position.pair} berhasil dijual${result.orderId ? ` (order ${result.orderId})` : ''}.`),
+        isError: Boolean(result.persistenceWarning),
+      });
+    } catch (error) {
+      setSellToast({
+        title: 'Status sell perlu diperiksa',
+        message: error instanceof Error ? error.message : 'Terjadi kendala saat menyimpan hasil sell. Periksa exchange sebelum mengulang order.',
+        isError: true,
+      });
+    } finally {
+      setIsSelling(false);
+    }
   };
 
   const handleOpenDetail = (pos: TradingPosition) => {
@@ -329,6 +360,22 @@ export const TradeHistoryTab: React.FC<TradeHistoryTabProps> = ({
 
   return (
     <div className="theme-legacy-surface space-y-4">
+      {sellToast && (
+        <div
+          role="status"
+          aria-live="polite"
+          className={`flex items-start justify-between gap-3 rounded-lg border px-4 py-3 text-sm ${sellToast.isError
+            ? 'border-red-500/40 bg-red-500/10 text-red-200'
+            : 'border-emerald-500/40 bg-emerald-500/10 text-emerald-200'}`}
+        >
+          <div>
+            <p className="font-semibold">{sellToast.title}</p>
+            <p className="mt-1 text-xs opacity-90">{sellToast.message}</p>
+          </div>
+          <button type="button" onClick={() => setSellToast(null)} aria-label="Tutup pesan sell" className="shrink-0 px-1 text-lg leading-none">×</button>
+        </div>
+      )}
+
       {/* Overview Metric Bar */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-2.5">
         <div className="p-3.5 rounded-xl bg-[#08101D] border border-[#14233A]">
@@ -635,12 +682,9 @@ export const TradeHistoryTab: React.FC<TradeHistoryTabProps> = ({
 
                           <button
                             type="button"
-                            onClick={() => {
-                              if (onForceTakeProfit) {
-                                onForceTakeProfit(pos.id);
-                              }
-                            }}
-                            className="py-1.5 px-2 rounded-lg bg-[#ea580c] hover:bg-[#c2410c] text-white font-bold text-xs flex items-center justify-center gap-1.5 transition shadow-sm cursor-pointer"
+                            onClick={() => void handleForceSell(pos)}
+                            disabled={isSelling || !onForceTakeProfit}
+                            className="py-1.5 px-2 rounded-lg bg-[#ea580c] hover:bg-[#c2410c] text-white font-bold text-xs flex items-center justify-center gap-1.5 transition shadow-sm cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
                             title="Eksekusi manual Sell / Take Profit di harga pasar"
                           >
                             <CreditCard className="w-3.5 h-3.5 stroke-[2.5]" />
@@ -718,12 +762,9 @@ export const TradeHistoryTab: React.FC<TradeHistoryTabProps> = ({
 
                           <button
                             type="button"
-                            onClick={() => {
-                              if (onForceTakeProfit) {
-                                onForceTakeProfit(pos.id);
-                              }
-                            }}
-                            className="py-1.5 px-2 rounded-lg bg-[#ea580c] hover:bg-[#c2410c] text-white font-bold text-xs flex items-center justify-center gap-1.5 transition shadow-sm cursor-pointer"
+                            onClick={() => void handleForceSell(pos)}
+                            disabled={isSelling || !onForceTakeProfit}
+                            className="py-1.5 px-2 rounded-lg bg-[#ea580c] hover:bg-[#c2410c] text-white font-bold text-xs flex items-center justify-center gap-1.5 transition shadow-sm cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
                           >
                             <CreditCard className="w-3.5 h-3.5 stroke-[2.5]" />
                             <span>Sell</span>

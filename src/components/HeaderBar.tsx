@@ -63,7 +63,7 @@ export function HeaderBar({
     currentUser,
     loginWithGoogle,
     logout,
-    isFirebaseConnected,
+    firebaseConnectionStatus,
     is2faVerified,
     isLoggingIn,
     isAdmin,
@@ -141,12 +141,16 @@ export function HeaderBar({
       <div className="flex items-center gap-1 sm:gap-2 relative shrink-0">
         {/* Firebase Cloud Sync Badge */}
         <div
-          title={isFirebaseConnected ? 'Firebase Firestore Cloud Database Connected' : 'Connecting to Firestore...'}
+          title={firebaseConnectionStatus === 'connected'
+            ? 'Firebase Firestore Cloud Database Connected'
+            : firebaseConnectionStatus === 'checking'
+              ? 'Checking Firestore connection...'
+              : 'Firestore connection failed. Check Firebase configuration and browser console.'}
           className="hidden sm:flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-slate-100 dark:bg-[#101A29] border border-slate-200 dark:border-[#1A283D] text-[10.5px] text-slate-600 dark:text-slate-300"
         >
-          <Database className={`w-3 h-3 ${isFirebaseConnected ? 'text-sky-500 dark:text-sky-400' : 'text-slate-400 animate-spin'}`} />
+          <Database className={`w-3 h-3 ${firebaseConnectionStatus === 'connected' ? 'text-sky-500 dark:text-sky-400' : firebaseConnectionStatus === 'checking' ? 'text-slate-400 animate-spin' : 'text-rose-500'}`} />
           <span className="hidden md:inline font-medium">Firestore</span>
-          <span className={`w-1.5 h-1.5 rounded-full ${isFirebaseConnected ? 'bg-emerald-500' : 'bg-slate-400'}`}></span>
+          <span className={`w-1.5 h-1.5 rounded-full ${firebaseConnectionStatus === 'connected' ? 'bg-emerald-500' : firebaseConnectionStatus === 'checking' ? 'bg-slate-400' : 'bg-rose-500'}`}></span>
         </div>
 
         {/* User Account / Google Sign In */}

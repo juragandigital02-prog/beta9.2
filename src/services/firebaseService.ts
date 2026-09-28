@@ -35,6 +35,12 @@ export const FIRESTORE_HISTORY_PAGE_SIZE = 50;
 
 const FIRESTORE_MAINTENANCE_PAGE_SIZE = 100;
 
+function omitUndefinedFields<T extends Record<string, unknown>>(record: T): T {
+  return Object.fromEntries(
+    Object.entries(record).filter(([, value]) => value !== undefined)
+  ) as T;
+}
+
 async function requireMemberId(userId: string): Promise<string> {
   if (typeof window !== 'undefined') {
     try {
@@ -824,12 +830,12 @@ export async function addTransactionToFirestore(userId: string, tx: TransactionR
   const path = `users/${userId}/transactions/${tx.id}`;
   try {
     const txRef = doc(db, 'users', userId, 'transactions', tx.id);
-    await setDoc(txRef, {
+    await setDoc(txRef, omitUndefinedFields({
       ...transaction,
       userId,
       createdAt: new Date().toISOString(),
       sourceAction: tx.sourceAction || 'transaction',
-    });
+    }));
   } catch (error) {
     if (!auth.currentUser) return;
     handleFirestoreError(error, OperationType.CREATE, path);
@@ -968,12 +974,12 @@ export async function addTradeRecordToFirestore(userId: string, trade: TradeReco
   const path = `users/${userId}/trade_history/${trade.id}`;
   try {
     const tradeRef = doc(db, 'users', userId, 'trade_history', trade.id);
-    await setDoc(tradeRef, {
+    await setDoc(tradeRef, omitUndefinedFields({
       ...trade,
       userId,
       memberId,
       createdAt: new Date().toISOString(),
-    });
+    }));
   } catch (error) {
     if (!auth.currentUser) return;
     handleFirestoreError(error, OperationType.CREATE, path);

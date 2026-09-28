@@ -31,6 +31,7 @@ import {
   LIVE_TICKER_SYMBOLS,
 } from './services/exchangeService';
 import { removeBotRunner as deleteBackgroundBot, registerBotRunner as registerBackgroundBot } from './services/botService';
+import { disconnectBotExchange, storeBotCredentials } from './api/botApi';
 import { activateWalletAccount as processWalletActivation } from './services/walletService';
 import { queryClient } from './queryClient';
 import { useUiStore } from './stores/uiStore';
@@ -227,6 +228,10 @@ function AppContent() {
     refetchInterval: 12000,
     refetchIntervalInBackground: false,
   });
+  const [liveTickerFeed, setLiveTickerFeed] = useState<{
+    prices: Record<string, number>;
+    receivedAt: number;
+  } | null>(null);
 
   // Per-exchange position cache: stores positions independently per exchange so switching doesn't lose data
   const [positionsByExchange, setPositionsByExchange] = useState<Map<string, TradingPosition[]>>(new Map());
@@ -348,11 +353,21 @@ function AppContent() {
     for (const p of positions) {
       if (typeof p.price === 'number') map[p.pair] = p.price;
     }
+    for (const [pair, ticker] of Object.entries(tickerQuery.data?.tickers || {})) {
+      if (typeof ticker.last === 'number' && ticker.last > 0) map[pair] = ticker.last;
+    }
+    if (
+      currentExchange.toLowerCase() === 'binance'
+      && liveTickerFeed
+      && Date.now() - liveTickerFeed.receivedAt < 20000
+    ) {
+      Object.assign(map, liveTickerFeed.prices);
+    }
     SUPPORTED_COINS.forEach((c) => {
       if (!map[c.pair]) map[c.pair] = c.price;
     });
     return map;
-  }, [positions]);
+  }, [positions, tickerQuery.dataUpdatedAt, currentExchange, liveTickerFeed]);
 
   // User Segmentation:
   // Kategori 1: User yang sudah mempunyai akun dan sudah membayar aktivasi (wallet.accountStatus === 'active')
@@ -467,6 +482,7 @@ function AppContent() {
   useEffect(() => {
     let isMounted = true;
     let ws: WebSocket | null = null;
+    setLiveTickerFeed(null);
 
     // Connect to public WebSocket stream for sub-second Binance updates.
     const connectWs = () => {
@@ -496,6 +512,12 @@ function AppContent() {
               }
 
               if (tickerMap.size > 0) {
+                const livePrices: Record<string, number> = {};
+                tickerMap.forEach((ticker, pair) => {
+                  livePrices[pair] = ticker.last;
+                });
+                setLiveTickerFeed({ prices: livePrices, receivedAt: Date.now() });
+
                 setPositions((prev) =>
                   prev.map((pos) => {
                     const match = tickerMap.get(pos.pair);
@@ -696,6 +718,9 @@ function AppContent() {
     setCurrentExchange(exchange);
 
     if (apiKey && secret) {
+      if (currentUser && !isDemoMode) {
+        await storeBotCredentials({ exchange, apiKey, secret, password: passphrase, isSandbox });
+      }
       const creds = {
         exchange,
         apiKey,
@@ -899,6 +924,13 @@ function AppContent() {
   // Disconnect a specific exchange API or active exchange
   const handleDisconnectSingleExchange = async (targetExchange?: ExchangeName) => {
     const exToDisconnect = targetExchange || wallet.connectedExchange?.exchange || currentExchange;
+
+    if (currentUser && !isDemoMode) {
+      const result = await disconnectBotExchange(exToDisconnect);
+      if (result.credentialsDeleted !== true) {
+        throw new Error('Server belum mengonfirmasi penghapusan kredensial exchange.');
+      }
+    }
 
     setActiveApiCredsMap((prev) => {
       const nextMap = new Map(prev);
@@ -2021,12 +2053,12 @@ function AppContent() {
     const target = positions.find((p) => p.id === posId);
     if (!target) return { success: false, error: 'Posisi tidak ditemukan.' };
 
-    const isProfit = target.floatingPnl > 0;
-    const grossProfit = isProfit ? target.floatingPnl : 0;
-    const netProfitTrader = isProfit ? grossProfit * 0.8 : 0;
-    const gasDeduction = isProfit ? grossProfit * 0.2 : 0;
-    const foundationKas = gasDeduction * 0.80; // 80% Fee Manajemen GAIN Foundation
-    const referralBonus = gasDeduction * 0.20; // 20% Bagi Hasil Cash untuk Referral / Upline Langsung (Bisa di-Withdrawal)
+    let isProfit = target.floatingPnl > 0;
+    let grossProfit = isProfit ? target.floatingPnl : 0;
+    let netProfitTrader = isProfit ? grossProfit * 0.8 : 0;
+    let gasDeduction = isProfit ? grossProfit * 0.2 : 0;
+    let foundationKas = gasDeduction * 0.80; // 80% Fee Manajemen GAIN Foundation
+    let referralBonus = gasDeduction * 0.20; // 20% Bagi Hasil Cash untuk Referral / Upline Langsung (Bisa di-Withdrawal)
 
     // Calculate real sell quantity based on allocation or unit price
     let sellAmount = 0.001;
@@ -2041,6 +2073,8 @@ function AppContent() {
       sellAmount = Number((usdtVal / target.price).toFixed(5));
     }
 
+    const originalPositionQty = sellAmount;
+    let executionPrice = Number(target.price) || 0;
     let exchangeOrderId: string | undefined;
     let exchangeOrderSuccess = false;
     let exchangeErrorMessage = '';
@@ -2059,20 +2093,49 @@ function AppContent() {
             amount: sellAmount,
             isSandbox: activeApiCreds.isSandbox,
         });
-        if (data.success) {
-          exchangeOrderId = data.orderId;
-          exchangeOrderSuccess = true;
-        } else {
-          exchangeErrorMessage = data.error || 'Gagal mengirim order ke exchange';
+        const filledAmount = Number(data.filled);
+        const filledPrice = Number(data.price);
+        const terminalStatus = ['filled', 'closed', 'partially_filled'].includes(String(data.status).toLowerCase());
+        if (!data.success || !data.orderId || !terminalStatus || !Number.isFinite(filledAmount) || filledAmount <= 0
+          || !Number.isFinite(filledPrice) || filledPrice <= 0) {
+          return {
+            success: false,
+            error: data.error || 'Bursa belum mengonfirmasi fill order. Posisi dan saldo tidak diubah.',
+            orderId: data.orderId,
+          };
         }
+        if (filledAmount > sellAmount * 1.001) {
+          return {
+            success: false,
+            error: 'Jumlah fill melebihi jumlah posisi. Jangan ulangi order; rekonsiliasi saldo exchange terlebih dahulu.',
+            orderId: data.orderId,
+          };
+        }
+
+        sellAmount = Math.min(filledAmount, sellAmount);
+        executionPrice = filledPrice;
+        exchangeOrderId = String(data.orderId);
+        exchangeOrderSuccess = true;
+        const averageEntryPrice = Number(target.avgBuyPrice || target.initialEntryPrice || target.price) || executionPrice;
+        const realizedPnl = (executionPrice - averageEntryPrice) * sellAmount;
+        isProfit = realizedPnl > 0;
+        grossProfit = Math.max(0, realizedPnl);
+        netProfitTrader = grossProfit * 0.8;
+        gasDeduction = grossProfit * 0.2;
+        foundationKas = gasDeduction * 0.8;
+        referralBonus = gasDeduction * 0.2;
       } catch (err: any) {
-        exchangeErrorMessage = err.message || 'Koneksi ke backend exchange terputus';
+        exchangeErrorMessage = err?.message || 'Koneksi ke backend exchange terputus';
+        return {
+          success: false,
+          error: `${exchangeErrorMessage}. Posisi dan saldo tidak diubah. Periksa status order di exchange sebelum mencoba lagi.`,
+        };
       }
     }
 
     // Capital recovery calculation
     const rawAllocUsdt = parseFloat(target.allocationUsdt.replace(/[^0-9.]/g, '')) || (sellAmount * (target.price || 0));
-    const marketValueUsdt = (sellAmount * (target.price || 0)) > 0 ? (sellAmount * (target.price || 0)) : Math.max(0, rawAllocUsdt + target.floatingPnl);
+    const marketValueUsdt = (sellAmount * executionPrice) > 0 ? (sellAmount * executionPrice) : Math.max(0, rawAllocUsdt + target.floatingPnl);
     const recoveredUsdt = isProfit ? netProfitTrader : marketValueUsdt;
 
     const newLiquid = wallet.liquidBalance + recoveredUsdt;
@@ -2089,20 +2152,24 @@ function AppContent() {
       volume24h: newVolume,
     }));
 
-    // Reset position back to Standby
+    const remainingQty = Math.max(0, originalPositionQty - sellAmount);
+    const positionClosed = remainingQty <= Math.max(1e-8, originalPositionQty * 0.001);
+    const remainingRatio = originalPositionQty > 0 ? remainingQty / originalPositionQty : 0;
+
+    // Keep any unfilled position active after a partial exchange fill.
     const updatedPos: TradingPosition = {
       ...target,
-      stepLayer: 1,
-      allocationQty: '0',
-      allocationUsdt: '0.00 USDT',
-      floatingPnl: 0,
-      roiPct: 0,
-      status: 'inactive',
-      statusLabel: 'STANDBY',
-      trailingProgressPct: 0,
+      stepLayer: positionClosed ? 1 : target.stepLayer,
+      allocationQty: positionClosed ? '0' : `${remainingQty.toFixed(8)} ${target.coin}`,
+      allocationUsdt: positionClosed ? '0.00 USDT' : `${(rawAllocUsdt * remainingRatio).toFixed(2)} USDT`,
+      floatingPnl: positionClosed ? 0 : target.floatingPnl * remainingRatio,
+      roiPct: positionClosed ? 0 : target.roiPct,
+      status: positionClosed ? 'inactive' : target.status,
+      statusLabel: positionClosed ? 'STANDBY' : target.statusLabel,
+      trailingProgressPct: positionClosed ? 0 : target.trailingProgressPct,
       trailingInfo: exchangeOrderSuccess
-        ? `Manual Sell Executed (${activeApiCreds?.exchange} #${exchangeOrderId})`
-        : (isProfit ? 'Take Profit Selesai' : 'Manual Sell Selesai'),
+        ? `${positionClosed ? 'Sell Executed' : 'Partial Sell Executed'} (${activeApiCreds?.exchange} #${exchangeOrderId})`
+        : (positionClosed ? (isProfit ? 'Take Profit Selesai' : 'Manual Sell Selesai') : 'Partial Sell'),
     };
 
     setPositions((prev) =>
@@ -2110,7 +2177,7 @@ function AppContent() {
     );
 
     // Send Take Profit notification & play triumphant major arpeggio chime
-    if (isProfit) {
+    if (isProfit && positionClosed) {
       notifyTakeProfit({
         pair: target.pair,
         coin: target.coin,
@@ -2127,7 +2194,7 @@ function AppContent() {
         coin: target.coin,
         profitUsdt: recoveredUsdt,
         roiPct: target.roiPct,
-        price: target.price,
+        price: executionPrice,
       });
     }
 
@@ -2169,19 +2236,23 @@ function AppContent() {
       symbol: target.pair,
       side: 'sell',
       type: 'market',
-      status: 'closed',
+      status: positionClosed ? 'closed' : 'filled',
       strategyName: target.engine,
       layerStep: target.stepLayer,
       isSandbox: activeApiCreds?.isSandbox ?? true,
-      price: target.price || 100,
+      price: executionPrice || 100,
       amount: sellAmount,
-      costUsdt: Number((sellAmount * (target.price || 1)).toFixed(2)),
+      costUsdt: Number((sellAmount * (executionPrice || 1)).toFixed(2)),
       fee: {
         cost: gasDeduction,
         currency: 'USDT',
       },
-      realizedPnl: target.floatingPnl,
-      pnlPercent: target.roiPct,
+      realizedPnl: exchangeOrderSuccess
+        ? (executionPrice - (Number(target.avgBuyPrice || target.initialEntryPrice || target.price) || executionPrice)) * sellAmount
+        : target.floatingPnl * (originalPositionQty > 0 ? sellAmount / originalPositionQty : 1),
+      pnlPercent: target.totalCostUsdt
+        ? (((executionPrice - (Number(target.avgBuyPrice || target.initialEntryPrice || target.price) || executionPrice)) * sellAmount) / target.totalCostUsdt) * 100
+        : target.roiPct,
       timestamp: Date.now(),
       datetime: new Date().toLocaleString(),
     };
@@ -2194,21 +2265,39 @@ function AppContent() {
     });
 
     if (currentUser) {
-      await updateUserWallet(currentUser.uid, {
-        liquidBalance: newLiquid,
-        gasReserve: newGasReserve,
-        gasConsumed: newGasConsumed,
-        volume24h: newVolume,
-      });
-      await updatePositionInFirestore(currentUser.uid, updatedPos);
-      await addTransactionToFirestore(currentUser.uid, profitTx);
-      await addTradeRecordToFirestore(currentUser.uid, tradeRec);
+      const persistenceResults = await Promise.allSettled([
+        updateUserWallet(currentUser.uid, {
+          liquidBalance: newLiquid,
+          gasReserve: newGasReserve,
+          gasConsumed: newGasConsumed,
+          volume24h: newVolume,
+        }),
+        updatePositionInFirestore(currentUser.uid, updatedPos),
+        addTransactionToFirestore(currentUser.uid, profitTx),
+        addTradeRecordToFirestore(currentUser.uid, tradeRec),
+      ]);
+      if (persistenceResults.some((result) => result.status === 'rejected')) {
+        return {
+          success: true,
+          orderId: exchangeOrderId,
+          isLiveExchange: exchangeOrderSuccess,
+          partial: !positionClosed,
+          filledAmount: sellAmount,
+          remainingAmount: positionClosed ? 0 : remainingQty,
+          netProfit: netProfitTrader,
+          gasDeduction,
+          persistenceWarning: 'Sell sudah diproses, tetapi sebagian data belum tersinkron ke Firestore. Jangan ulangi order; periksa riwayat dan saldo.',
+        };
+      }
     }
 
     return {
       success: true,
       orderId: exchangeOrderId,
       isLiveExchange: exchangeOrderSuccess,
+      partial: !positionClosed,
+      filledAmount: sellAmount,
+      remainingAmount: positionClosed ? 0 : remainingQty,
       netProfit: netProfitTrader,
       gasDeduction,
       exchangeError: exchangeErrorMessage,
@@ -2480,6 +2569,7 @@ function AppContent() {
     botId?: string;
     botName?: string;
     isNewBot?: boolean;
+    executionMode: 'paper' | 'live';
     pair: string;
     pairedCoins?: string[];
     botMode: BotMode;
@@ -2500,6 +2590,12 @@ function AppContent() {
     maxPrice?: number;
     steps?: AveragingStep[];
   }) => {
+    if (config.executionMode === 'live'
+      && (!activeApiCreds?.apiKey || !activeApiCreds.isSandbox || activeApiCreds.exchange !== currentExchange)) {
+      showToast('Mode Live Testnet memerlukan API key sandbox untuk exchange yang sedang dipilih.', 'error');
+      return;
+    }
+
     const coinsToDeploy = Array.isArray(config.pairedCoins) && config.pairedCoins.length > 0
       ? config.pairedCoins
       : [config.pair];
@@ -2673,7 +2769,7 @@ function AppContent() {
     // Sync with 24/7 backend background bot runner only if active
     if (initialStatus === 'active') {
       try {
-        registerBackgroundBot({
+        const registration = await registerBackgroundBot({
             botId: primaryBotId,
             botName: finalBotName,
             pair: coinsToDeploy[0],
@@ -2692,12 +2788,43 @@ function AppContent() {
             maxPrice: config.maxPrice || 0,
             steps: config.steps,
             exchange: currentExchange,
-            isSandbox: wallet.connectedExchange?.isSandbox || false,
-            apiKey: activeApiCreds?.apiKey,
-            secret: activeApiCreds?.secret,
-            password: activeApiCreds?.password,
-        }).catch(() => {});
-      } catch {}
+            isSandbox: config.executionMode === 'live' ? true : Boolean(wallet.connectedExchange?.isSandbox),
+            mode: config.executionMode,
+        });
+        if (registration.success !== true) throw new Error('BOT_REGISTRATION_REJECTED');
+      } catch (error) {
+        let cleanupConfirmed = false;
+        try {
+          const cleanup = await deleteBackgroundBot(primaryBotId);
+          cleanupConfirmed = cleanup.success === true;
+        } catch {}
+
+        const standbyPositions = updatedOrNewPositions.map((position) => ({
+          ...position,
+          status: 'inactive' as const,
+          statusLabel: 'STANDBY',
+        }));
+        const standbyIds = new Set(standbyPositions.map((position) => position.id));
+        setPositions((prev) => [
+          ...standbyPositions,
+          ...prev.filter((position) => !standbyIds.has(position.id)),
+        ]);
+        if (currentUser) {
+          await Promise.allSettled(standbyPositions.map((position) => updatePositionInFirestore(currentUser.uid, position)));
+        }
+        const code = typeof (error as { code?: unknown })?.code === 'string'
+          ? String((error as { code: string }).code)
+          : 'BOT_REGISTRATION_FAILED';
+        showToast(
+          cleanupConfirmed
+            ? `Runner bot gagal didaftarkan (${code}); posisi dikembalikan ke standby.`
+            : `Runner bot gagal didaftarkan (${code}) dan pembersihan server belum terkonfirmasi. Periksa status bot sebelum mencoba lagi.`,
+          'error'
+        );
+        setIsMatrixModalOpen(false);
+        handleRouteChange('trading');
+        return;
+      }
     }
 
     setIsMatrixModalOpen(false);
@@ -2795,6 +2922,7 @@ function AppContent() {
                   onOpenMatrixModal={handleOpenCustomBot}
                   onOpenSimulation={() => setIsSimulationModalOpen(true)}
                   onDeployBotToExchange={protectAction(handleExecuteLiveBotOrder)}
+                  currentPrices={currentPricesMap}
                   connectedExchangeName={wallet.connectedExchange?.exchange || currentExchange}
                   isSandbox={wallet.connectedExchange?.isSandbox ?? true}
                   isAccountActive={wallet.accountStatus === 'active'}
@@ -2897,6 +3025,11 @@ function AppContent() {
             ? (wallet.connectedExchange.usdtBalance ?? 70)
             : (wallet.liquidBalance || 70)
         }
+        isTestnetConnected={Boolean(
+          activeApiCreds?.apiKey
+          && activeApiCreds.isSandbox
+          && activeApiCreds.exchange === currentExchange
+        )}
         onOpenSimulation={() => {
           setIsMatrixModalOpen(false);
           setIsSimulationModalOpen(true);
