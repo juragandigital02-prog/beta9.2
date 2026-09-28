@@ -63,8 +63,10 @@ export function AccountView({
   const [copiedLink, setCopiedLink] = useState(false);
   const [copiedId, setCopiedId] = useState(false);
   const [confirmDisconnectApi, setConfirmDisconnectApi] = useState(false);
-  const { currentUser, loginWithGoogle, logout, isFirebaseConnected, isLoggingIn, isAdmin, openLogin, openRegister } = useAuth();
+  const { currentUser, loginWithGoogle, logout, isFirebaseConnected, isLoggingIn, isAdmin, openLogin, openRegister, retryUserProfileSync } = useAuth();
   const { theme, themePreference, setTheme } = useTheme();
+  const [isSyncingMemberId, setIsSyncingMemberId] = useState(false);
+  const [memberIdSyncFailed, setMemberIdSyncFailed] = useState(false);
 
   const referralLink = `https://gainkoin.io/register?ref=${wallet.memberId}`;
 
@@ -75,9 +77,27 @@ export function AccountView({
   };
 
   const copyMemberId = () => {
+    if (!wallet.memberId) return;
     navigator.clipboard.writeText(wallet.memberId);
     setCopiedId(true);
     setTimeout(() => setCopiedId(false), 2000);
+  };
+
+  const handleMemberIdAction = async () => {
+    if (wallet.memberId) {
+      copyMemberId();
+      return;
+    }
+    setIsSyncingMemberId(true);
+    setMemberIdSyncFailed(false);
+    try {
+      await retryUserProfileSync();
+    } catch (error) {
+      setMemberIdSyncFailed(true);
+      console.error('Member ID profile sync failed:', error);
+    } finally {
+      setIsSyncingMemberId(false);
+    }
   };
 
   const isAccountActive = wallet.accountStatus === 'active';
@@ -118,10 +138,11 @@ export function AccountView({
           <div className="text-right">
             <span className="text-[10px] text-slate-400 font-sans block">Member ID:</span>
             <button
-              onClick={copyMemberId}
+              onClick={handleMemberIdAction}
+              title={wallet.memberId ? 'Salin Member ID' : 'Coba sinkronkan Member ID dari Firebase'}
               className="mt-0.5 font-mono text-xs font-bold text-slate-800 dark:text-slate-200 hover:text-emerald-500 dark:hover:text-emerald-400 hover:underline flex items-center gap-1"
             >
-              <span>{wallet.memberId}</span>
+              <span>{wallet.memberId || (isSyncingMemberId ? 'Menyiapkan...' : memberIdSyncFailed ? 'Gagal, coba lagi' : 'Belum tersinkron')}</span>
               {copiedId ? <Check className="w-3 h-3 text-emerald-500" /> : <Copy className="w-3 h-3 text-slate-400" />}
             </button>
           </div>

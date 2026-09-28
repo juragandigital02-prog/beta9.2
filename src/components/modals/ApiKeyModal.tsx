@@ -51,7 +51,7 @@ interface ApiKeyModalProps {
       valueUsdt: number;
     }>,
     totalPortfolioUsdt?: number
-  ) => void;
+  ) => void | Promise<void>;
 }
 
 interface TestnetGuideInfo {
@@ -196,6 +196,12 @@ export function ApiKeyModal({
   const [selectedGuideEx, setSelectedGuideEx] = useState<ExchangeName>(initialExchange || 'Binance');
 
   const [isLoading, setIsLoading] = useState(false);
+  const [isApplyingConnection, setIsApplyingConnection] = useState(false);
+  const [connectionPopup, setConnectionPopup] = useState<{
+    success: boolean;
+    title: string;
+    message: string;
+  } | null>(null);
   const [loadingStep, setLoadingStep] = useState('Memverifikasi Signature...');
   const [showSpeedTip, setShowSpeedTip] = useState(false);
   const [testResult, setTestResult] = useState<{
@@ -236,6 +242,7 @@ export function ApiKeyModal({
       setPassphrase('demo_passphrase_123');
     }
     setTestResult(null);
+    setConnectionPopup(null);
   };
 
   const handleDisconnect = () => {
@@ -260,20 +267,24 @@ export function ApiKeyModal({
     const cleanPassphrase = passphrase.trim().replace(/[\u200B-\u200D\uFEFF\r\n\t]/g, '');
 
     if (!cleanApiKey || !cleanSecret) {
+      const message = 'Lengkapi API Key dan Secret Key terlebih dahulu.';
       setTestResult({
         success: false,
-        message: 'Lengkapi API Key dan Secret Key terlebih dahulu.',
+        message,
         error: 'API Key dan Secret Key tidak boleh kosong.',
       });
+      setConnectionPopup({ success: false, title: 'Koneksi API gagal', message });
       return;
     }
 
     if (requiresPassphrase && !cleanPassphrase) {
+      const message = `Exchange ${exchange} memerlukan Passphrase API.`;
       setTestResult({
         success: false,
-        message: `Exchange ${exchange} memerlukan Passphrase API.`,
+        message,
         error: 'Passphrase wajib diisi untuk Bitget dan OKX.',
       });
+      setConnectionPopup({ success: false, title: 'Koneksi API gagal', message });
       return;
     }
 
@@ -284,6 +295,7 @@ export function ApiKeyModal({
         : 'Mengirim Signature HMAC-SHA256 ke Mainnet...'
     );
     setTestResult(null);
+    setConnectionPopup(null);
 
     const stepTimer1 = setTimeout(() => {
       setLoadingStep('Bursa Memvalidasi Signature & Hak Akses Spot...');
@@ -319,27 +331,44 @@ export function ApiKeyModal({
           portfolioAssets: data.portfolioAssets,
         });
       } else {
+        const message = data.error || 'Gagal terhubung ke exchange.';
         setTestResult({
           success: false,
           message: 'Koneksi API Gagal Terverifikasi',
-          error: data.error || 'Gagal terhubung ke exchange.',
+          error: message,
           latencyMs: data.latencyMs,
+        });
+        setConnectionPopup({
+          success: false,
+          title: `Koneksi ${isSandbox ? 'Demo' : 'Live'} gagal`,
+          message,
         });
       }
     } catch (err: any) {
       clearTimeout(timeoutId);
       if (err.name === 'AbortError') {
+        const message = 'Bursa tidak merespons dalam 18 detik. Periksa mode Demo/Live dan koneksi internet.';
         setTestResult({
           success: false,
           message: 'Waktu Verifikasi Timeout (18 detik)',
-          error:
-            'Bursa tidak merespons dalam 18 detik. Periksa apakah mode Testnet/Mainnet sesuai dengan jenis API Key Anda atau cek koneksi internet.',
+          error: message,
+        });
+        setConnectionPopup({
+          success: false,
+          title: `Koneksi ${isSandbox ? 'Demo' : 'Live'} gagal`,
+          message,
         });
       } else {
+        const message = err.message || 'Network error.';
         setTestResult({
           success: false,
           message: 'Gagal menghubungi server proxy GAIN.',
-          error: err.message || 'Network error.',
+          error: message,
+        });
+        setConnectionPopup({
+          success: false,
+          title: `Koneksi ${isSandbox ? 'Demo' : 'Live'} gagal`,
+          message,
         });
       }
     } finally {
@@ -347,6 +376,45 @@ export function ApiKeyModal({
       clearTimeout(stepTimer2);
       clearTimeout(timeoutId);
       setIsLoading(false);
+    }
+  };
+
+  const handleApplyConnection = async () => {
+    if (!testResult?.success) return;
+    if (!onConnectSuccess) {
+      setConnectionPopup({
+        success: false,
+        title: 'Koneksi belum tersimpan',
+        message: 'Aksi simpan koneksi belum tersedia. Silakan coba lagi.',
+      });
+      return;
+    }
+
+    setIsApplyingConnection(true);
+    try {
+      await onConnectSuccess(
+        exchange,
+        testResult.usdtAvailable ?? 0,
+        isSandbox,
+        apiKey,
+        apiSecret,
+        passphrase,
+        testResult.portfolioAssets,
+        testResult.totalPortfolioUsdt
+      );
+      setConnectionPopup({
+        success: true,
+        title: 'Exchange berhasil dihubungkan',
+        message: `${exchange} berhasil diverifikasi dan disinkronkan dalam mode ${isSandbox ? 'Demo' : 'Live'}.`,
+      });
+    } catch (error: any) {
+      setConnectionPopup({
+        success: false,
+        title: 'Gagal menyimpan koneksi',
+        message: error?.message || `Kredensial terverifikasi, tetapi sinkronisasi mode ${isSandbox ? 'Demo' : 'Live'} gagal.`,
+      });
+    } finally {
+      setIsApplyingConnection(false);
     }
   };
 
@@ -402,6 +470,7 @@ export function ApiKeyModal({
                 onClick={() => {
                   setConnectionMode('testnet');
                   setTestResult(null);
+                  setConnectionPopup(null);
                 }}
                 className={`p-3 rounded-xl border transition text-left cursor-pointer flex items-start gap-2.5 ${
                   connectionMode === 'testnet'
@@ -442,6 +511,7 @@ export function ApiKeyModal({
                 onClick={() => {
                   setConnectionMode('live');
                   setTestResult(null);
+                  setConnectionPopup(null);
                 }}
                 className={`p-3 rounded-xl border transition text-left cursor-pointer flex items-start gap-2.5 ${
                   connectionMode === 'live'
@@ -560,6 +630,7 @@ export function ApiKeyModal({
                     setExchange(ex);
                     setSelectedGuideEx(ex);
                     setTestResult(null);
+                    setConnectionPopup(null);
                   }}
                   className={`py-2 px-2 rounded-xl border text-center transition cursor-pointer flex flex-col items-center justify-center gap-0.5 ${
                     exchange === ex
@@ -733,7 +804,11 @@ export function ApiKeyModal({
             <input
               type="text"
               value={apiKey}
-              onChange={(e) => setApiKey(e.target.value)}
+              onChange={(e) => {
+                setApiKey(e.target.value);
+                setTestResult(null);
+                setConnectionPopup(null);
+              }}
               placeholder={
                 connectionMode === 'testnet'
                   ? `Masukkan API Key ${exchange} Testnet atau klik "Isi Kredensial Demo"...`
@@ -751,7 +826,11 @@ export function ApiKeyModal({
             <input
               type="password"
               value={apiSecret}
-              onChange={(e) => setApiSecret(e.target.value)}
+              onChange={(e) => {
+                setApiSecret(e.target.value);
+                setTestResult(null);
+                setConnectionPopup(null);
+              }}
               placeholder={`Masukkan Secret Key ${exchange}...`}
               className="w-full px-3.5 py-2.5 rounded-xl bg-[#09111E] border border-[#162740] font-mono text-xs text-white focus:outline-none focus:border-[#00F0C8]"
               required
@@ -766,7 +845,11 @@ export function ApiKeyModal({
               <input
                 type="password"
                 value={passphrase}
-                onChange={(e) => setPassphrase(e.target.value)}
+                onChange={(e) => {
+                  setPassphrase(e.target.value);
+                  setTestResult(null);
+                  setConnectionPopup(null);
+                }}
                 placeholder={`Masukkan Passphrase yang Anda tentukan saat membuat API di ${exchange}...`}
                 className="w-full px-3.5 py-2.5 rounded-xl bg-[#09111E] border border-[#162740] font-mono text-xs text-white focus:outline-none focus:border-[#00F0C8]"
                 required
@@ -897,25 +980,12 @@ export function ApiKeyModal({
 
                   <button
                     type="button"
-                    onClick={() => {
-                      if (onConnectSuccess) {
-                        onConnectSuccess(
-                          exchange,
-                          testResult.usdtAvailable ?? 0,
-                          isSandbox,
-                          apiKey,
-                          apiSecret,
-                          passphrase,
-                          testResult.portfolioAssets,
-                          testResult.totalPortfolioUsdt
-                        );
-                      }
-                      onClose();
-                    }}
-                    className="w-full py-2.5 px-3 rounded-xl bg-gradient-to-r from-[#00F0C8] to-[#00D0AD] text-slate-950 font-bold text-xs flex items-center justify-center gap-1.5 shadow-lg shadow-[#00F0C8]/20 hover:opacity-95 transition cursor-pointer"
+                    onClick={handleApplyConnection}
+                    disabled={isApplyingConnection}
+                    className="w-full py-2.5 px-3 rounded-xl bg-gradient-to-r from-[#00F0C8] to-[#00D0AD] text-slate-950 font-bold text-xs flex items-center justify-center gap-1.5 shadow-lg shadow-[#00F0C8]/20 hover:opacity-95 transition cursor-pointer disabled:opacity-60"
                   >
-                    <CheckCircle2 className="w-4 h-4" />
-                    <span>Terapkan ke Dashboard & Sinkronkan Saldo ({isSandbox ? 'Testnet' : 'Live'})</span>
+                    {isApplyingConnection ? <RefreshCw className="w-4 h-4 animate-spin" /> : <CheckCircle2 className="w-4 h-4" />}
+                    <span>{isApplyingConnection ? 'Menyimpan koneksi...' : `Terapkan ke Dashboard (${isSandbox ? 'Demo' : 'Live'})`}</span>
                   </button>
                 </div>
               )}
@@ -964,6 +1034,47 @@ export function ApiKeyModal({
           </div>
         </form>
       </div>
+
+      {connectionPopup && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/75 backdrop-blur-sm" role="presentation">
+          <div
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="exchange-connection-result-title"
+            className="w-full max-w-sm rounded-2xl border border-slate-700 bg-[#0B1320] p-5 shadow-2xl"
+          >
+            <div className="flex items-start gap-3">
+              {connectionPopup.success
+                ? <CheckCircle2 className="mt-0.5 h-6 w-6 shrink-0 text-emerald-400" />
+                : <AlertCircle className="mt-0.5 h-6 w-6 shrink-0 text-red-400" />}
+              <div>
+                <h3 id="exchange-connection-result-title" className="text-sm font-bold text-white">
+                  {connectionPopup.title}
+                </h3>
+                <p className="mt-1 text-xs leading-relaxed text-slate-300">{connectionPopup.message}</p>
+                <p className="mt-2 text-[10px] font-mono text-slate-400">
+                  {exchange} · {isSandbox ? 'Demo' : 'Live'}
+                </p>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                const connected = connectionPopup.success;
+                setConnectionPopup(null);
+                if (connected) onClose();
+              }}
+              className={`mt-5 w-full rounded-xl px-4 py-2.5 text-xs font-bold transition ${
+                connectionPopup.success
+                  ? 'bg-emerald-400 text-slate-950 hover:bg-emerald-300'
+                  : 'bg-slate-800 text-slate-100 hover:bg-slate-700'
+              }`}
+            >
+              {connectionPopup.success ? 'Selesai' : 'Tutup'}
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

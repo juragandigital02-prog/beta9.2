@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { MailCheck, Mail, AlertCircle, ArrowRight, LogOut, CheckCircle2 } from 'lucide-react';
+import { requestEmailVerificationCode, verifyEmailCode } from '../../services/authService';
 
 interface GmailVerificationModalProps {
   isOpen: boolean;
@@ -18,8 +19,9 @@ export function GmailVerificationModal({
 }: GmailVerificationModalProps) {
   const [code, setCode] = useState('');
   const [errorMsg, setErrorMsg] = useState('');
+  const [isSending, setIsSending] = useState(false);
   const [isVerifying, setIsVerifying] = useState(false);
-  const [countdown, setCountdown] = useState(60);
+  const [countdown, setCountdown] = useState(0);
 
   useEffect(() => {
     let timer: any;
@@ -31,9 +33,18 @@ export function GmailVerificationModal({
 
   if (!isOpen) return null;
 
-  const handleResend = () => {
-    setCountdown(60);
+  const handleResend = async () => {
+    if (isSending || countdown > 0) return;
     setErrorMsg('');
+    setIsSending(true);
+    try {
+      await requestEmailVerificationCode();
+      setCountdown(60);
+    } catch (err: any) {
+      setErrorMsg(err?.message || 'Gagal mengirim kode verifikasi.');
+    } finally {
+      setIsSending(false);
+    }
   };
 
   const handleVerify = async () => {
@@ -46,6 +57,7 @@ export function GmailVerificationModal({
 
     setIsVerifying(true);
     try {
+      await verifyEmailCode(clean);
       await onVerificationSuccess();
     } catch (err: any) {
       setErrorMsg(err?.message || 'Verifikasi gagal');
@@ -105,10 +117,10 @@ export function GmailVerificationModal({
           <div className="flex items-center justify-between text-xs font-mono pt-3 border-t border-slate-800/80">
             <button
               onClick={handleResend}
-              disabled={countdown > 0}
+              disabled={isSending || countdown > 0}
               className="text-slate-400 hover:text-cyan-400 disabled:opacity-50 cursor-pointer transition"
             >
-              {countdown > 0 ? `Kirim ulang (${countdown}s)` : 'Kirim Ulang Kode'}
+              {isSending ? 'Mengirim kode...' : countdown > 0 ? `Kirim ulang (${countdown}s)` : 'Kirim Kode ke Gmail'}
             </button>
 
             <button

@@ -32,6 +32,7 @@ export interface ExecutedLayerDetail {
 
 export interface TradingPosition {
   id: string;
+  memberId?: string;
   coin: string;
   pair: string;
   botId?: string;
@@ -126,6 +127,10 @@ export interface AveragingStep {
 
 export interface TransactionRecord {
   id: string;
+  memberId?: string;
+  sourceMemberId?: string;
+  recipientMemberId?: string;
+  bonusType?: string;
   title: string;
   type: 'inflow' | 'outflow' | 'gas';
   status: 'Success' | 'Completed' | 'Gas Tank' | 'Confirmed';
@@ -146,6 +151,7 @@ export interface TransactionRecord {
 export interface WalletLedgerEntry {
   id: string;
   userId: string;
+  memberId?: string;
   type: 'inflow' | 'outflow' | 'transfer' | 'gas' | 'adjustment';
   amount: number;
   balanceBefore: number;
@@ -200,10 +206,10 @@ export interface NetworkMember {
   sponsorId: string;
   joinDate: string;
   accountStatus: 'active' | 'non-active';
-  botStatus: 'ACTIVE' | 'STANDBY';
+  botStatus?: 'ACTIVE' | 'STANDBY';
   exchangeConnected?: string;
-  totalTurnoverUsdt: number;
-  bonusYieldUsdt: number;
+  totalTurnoverUsdt?: number;
+  bonusYieldUsdt?: number;
   isDemoSimulation?: boolean;
 }
 
@@ -268,6 +274,7 @@ export interface BotSettingsConfig {
 
 export interface TradeRecord {
   id: string;
+  memberId?: string;
   orderId?: string;
   exchange: string;
   symbol: string;

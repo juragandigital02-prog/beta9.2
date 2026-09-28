@@ -135,7 +135,7 @@ export function GasFeeModal({
       const data = await addGasReserve({
           amount: numAmount,
           bonusAmount: bonusUsdt,
-          memberId: memberId || 'GN-MEMBER',
+          memberId,
           otp2fa: otp2fa.trim(),
           userSecret,
       });

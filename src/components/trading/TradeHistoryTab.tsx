@@ -247,7 +247,7 @@ export const TradeHistoryTab: React.FC<TradeHistoryTabProps> = ({
             <div class="subtitle">Platform Algoritma Kuantitatif Non-Kustodial · Dicetak pada ${new Date().toLocaleString('id-ID')}</div>
           </div>
           <div style="text-align: right;">
-            <div style="font-size: 12px; font-weight: 700; color: #0f172a;">Member ID: ${wallet.memberId || 'GN-MEMBER'}</div>
+            <div style="font-size: 12px; font-weight: 700; color: #0f172a;">Member ID: ${wallet.memberId || '-'}</div>
             <div style="font-size: 10px; color: #64748b;">${wallet.email || 'Akun Terverifikasi'}</div>
           </div>
         </div>
@@ -829,6 +829,8 @@ export const TradeHistoryTab: React.FC<TradeHistoryTabProps> = ({
 
                       <div className="flex items-center gap-2 text-slate-400 text-[10px] mt-1">
                         <span>{formattedDate}</span>
+                        <span>·</span>
+                        <span>Member: {t.memberId || wallet.memberId}</span>
                         <span>·</span>
                         <span>ID: {t.orderId?.substring(0, 10) || t.id.substring(0, 10)}</span>
                       </div>

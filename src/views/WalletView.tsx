@@ -132,6 +132,9 @@ export function WalletView({
     const q = searchQuery.toLowerCase();
     return (
       tx.title.toLowerCase().includes(q) ||
+      (tx.memberId && tx.memberId.toLowerCase().includes(q)) ||
+      (tx.sourceMemberId && tx.sourceMemberId.toLowerCase().includes(q)) ||
+      (tx.recipientMemberId && tx.recipientMemberId.toLowerCase().includes(q)) ||
       (tx.counterparty && tx.counterparty.toLowerCase().includes(q)) ||
       (tx.txHash && tx.txHash.toLowerCase().includes(q))
     );
@@ -140,11 +143,11 @@ export function WalletView({
   const handleExportCsv = () => {
     const csvContent =
       'data:text/csv;charset=utf-8,' +
-      'ID,Title,Type,Status,Timestamp,Counterparty,Amount,Fee\n' +
+      'ID,Member ID,Source Member ID,Recipient Member ID,Title,Type,Status,Timestamp,Counterparty,Amount,Fee\n' +
       transactions
         .map(
           (t) =>
-            `${t.id},"${t.title}",${t.type},${t.status},"${t.timestamp}","${t.counterparty || ''}",${t.amount},"${t.feeInfo}"`
+            `${t.id},${t.memberId || ''},${t.sourceMemberId || ''},${t.recipientMemberId || ''},"${t.title}",${t.type},${t.status},"${t.timestamp}","${t.counterparty || ''}",${t.amount},"${t.feeInfo}"`
         )
         .join('\n');
     const encodedUri = encodeURI(csvContent);
@@ -727,6 +730,9 @@ export function WalletView({
 
                     <div className="text-[11px] text-slate-500 dark:text-slate-400 font-sans mt-0.5 space-x-2">
                       <span>{tx.timestamp}</span>
+                      {tx.memberId && <span>• Member: <strong className="font-mono font-normal">{tx.memberId}</strong></span>}
+                      {tx.sourceMemberId && <span>• Sumber: <strong className="font-mono font-normal">{tx.sourceMemberId}</strong></span>}
+                      {tx.recipientMemberId && <span>• Penerima: <strong className="font-mono font-normal">{tx.recipientMemberId}</strong></span>}
                       {tx.counterparty && (
                         <span>
                           • {tx.counterpartyLabel || ''}

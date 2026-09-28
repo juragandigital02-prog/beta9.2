@@ -22,10 +22,12 @@ export class ApiRequestError extends Error {
   }
 }
 
-export async function postJson<T>(url: string, body: unknown, signal?: AbortSignal): Promise<T> {
+export async function postJson<T>(url: string, body: unknown, signal?: AbortSignal, authorizationToken?: string): Promise<T> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (authorizationToken) headers.Authorization = `Bearer ${authorizationToken}`;
   const response = await fetch(url, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     body: JSON.stringify(body),
     cache: 'no-store',
     signal,

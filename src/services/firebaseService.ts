@@ -19,7 +19,7 @@ import {
 import { db, auth, handleFirestoreError, OperationType } from '../firebase';
 import { UserWallet, TradingPosition, TransactionRecord, TradeRecord } from '../types';
 import { initialWallet, initialPositions, initialTransactions } from '../data/mockData';
-import { generateCleanMemberId, registerMemberInDirectory } from './memberService';
+import { isValidMemberId, registerMemberInDirectory, reserveMemberId } from './memberService';
 import { generateDedicatedBEP20Address } from './walletGeneratorService';
 import { validateFinancialAction } from '../utils/serverValidation';
 
@@ -34,6 +34,25 @@ export interface FirestorePage<T> {
 export const FIRESTORE_HISTORY_PAGE_SIZE = 50;
 
 const FIRESTORE_MAINTENANCE_PAGE_SIZE = 100;
+
+async function requireMemberId(userId: string): Promise<string> {
+  if (typeof window !== 'undefined') {
+    try {
+      const wallet = JSON.parse(localStorage.getItem(`gain_wallet_${userId}`) || 'null') as UserWallet | null;
+      if (isValidMemberId(wallet?.memberId)) return wallet.memberId;
+    } catch {
+      // Fall through to the Firestore profile.
+    }
+  }
+
+  if (!auth.currentUser || auth.currentUser.uid !== userId) {
+    return '';
+  }
+  const profile = await getDoc(doc(db, 'users', userId));
+  const memberId = profile.data()?.memberId;
+  if (!isValidMemberId(memberId)) throw new Error('Member ID akun belum tersedia.');
+  return memberId;
+}
 
 function isClientLedgerWriteAllowed(): boolean {
   if (typeof window === 'undefined') return false;
@@ -58,15 +77,22 @@ async function loadAllUserPositionDocuments(userId: string): Promise<QueryDocume
 }
 
 export async function initUserProfile(
-  user: { uid: string; displayName?: string | null; email?: string | null },
+  user: { uid: string; displayName?: string | null; email?: string | null; emailVerified?: boolean },
   registrationData?: { sponsorId?: string; sponsorName?: string; desiredUsername?: string }
 ) {
   const googleEmail = user.email || 'user@gainkoin.io';
   const isAdminUser = false;
   const googleName = registrationData?.desiredUsername || user.displayName || googleEmail.split('@')[0] || 'Member GAIN';
-  const cleanMemberId = isAdminUser ? 'GN-00001' : generateCleanMemberId(user.uid);
-  const sponsorId = registrationData?.sponsorId || 'GN-10001';
-  const sponsorName = registrationData?.sponsorName || (sponsorId === 'GN-10001' ? 'Master GAIN Foundation' : 'Upline Referral GAIN');
+  const userRef = doc(db, 'users', user.uid);
+  const profileSnap = auth.currentUser ? await getDoc(userRef) : null;
+  const existingProfile = profileSnap?.exists() ? profileSnap.data() : null;
+  const cleanMemberId = isValidMemberId(existingProfile?.memberId)
+    ? existingProfile.memberId
+    : auth.currentUser
+      ? await reserveMemberId(user.uid)
+      : initialWallet.memberId;
+  const sponsorId = registrationData?.sponsorId || '';
+  const sponsorName = registrationData?.sponsorName || '';
   const depositAddress = generateDedicatedBEP20Address(cleanMemberId, googleEmail);
 
   // Initialize or load local wallet cache
@@ -101,48 +127,30 @@ export async function initUserProfile(
       liquidBalance: isAdminUser ? 5000 : 0,
       availableCash: isAdminUser ? 5000 : 0,
       gasReserve: isAdminUser ? 1000 : 0,
-      emailVerified: true,
+      emailVerified: user.emailVerified === true,
     };
     if (typeof window !== 'undefined') {
       localStorage.setItem(localKey, JSON.stringify(newWallet));
     }
-  } else if (!cachedWallet.depositAddress) {
-    cachedWallet.depositAddress = depositAddress;
+  } else if (cachedWallet.memberId !== cleanMemberId || !cachedWallet.depositAddress) {
+    cachedWallet.memberId = cleanMemberId;
+    cachedWallet.depositAddress = cachedWallet.depositAddress || depositAddress;
     if (typeof window !== 'undefined') {
       localStorage.setItem(localKey, JSON.stringify(cachedWallet));
     }
   }
 
-  await registerMemberInDirectory({
-    memberId: cleanMemberId,
-    userId: user.uid,
-    username: googleName,
-    accountStatus: isAdminUser ? 'active' : 'non-active',
-    emailMasked: googleEmail
-      ? `${googleEmail.slice(0, 3)}***@${googleEmail.split('@')[1] || 'gmail.com'}`
-      : 'user***@gmail.com',
-    sponsorId,
-    sponsorName,
-    joinedAt: new Date().toISOString(),
-  });
-
   // If Firebase Auth does not have active token (e.g. instant session mode), skip remote Firestore write to avoid permission errors
-  if (!auth.currentUser) {
+  if (!auth.currentUser || !profileSnap) {
     return;
   }
 
-  const userRef = doc(db, 'users', user.uid);
   try {
-    const snap = await getDoc(userRef);
-    const googleEmail = user.email || 'user@gainkoin.io';
-    const isAdminUser = false;
-    const googleName = registrationData?.desiredUsername || user.displayName || googleEmail.split('@')[0] || 'Member GAIN';
-    const depositAddress = generateDedicatedBEP20Address(isAdminUser ? 'GN-00001' : generateCleanMemberId(user.uid), googleEmail);
+    const snap = profileSnap;
 
     if (!snap.exists()) {
-      const cleanMemberId = isAdminUser ? 'GN-00001' : generateCleanMemberId(user.uid);
-      const sponsorId = registrationData?.sponsorId || 'GN-10001';
-      const sponsorName = registrationData?.sponsorName || (sponsorId === 'GN-10001' ? 'Master GAIN Foundation' : 'Upline Referral GAIN');
+      const sponsorId = registrationData?.sponsorId || '';
+      const sponsorName = registrationData?.sponsorName || '';
 
       const newWallet: UserWallet = {
         ...initialWallet,
@@ -190,7 +198,7 @@ export async function initUserProfile(
         totalReferralBonusUsdt: newWallet.totalReferralBonusUsdt,
         twoFactorEnabled: newWallet.twoFactorEnabled ?? true,
         twoFactorSecret: newWallet.twoFactorSecret ?? 'JBSWY3DPEHPK3PXPJA2G6ZRA',
-        emailVerified: isAdminUser ? true : false,
+        emailVerified: isAdminUser || user.emailVerified === true,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
       });
@@ -214,6 +222,7 @@ export async function initUserProfile(
         await setDoc(posRef, {
           ...pos,
           userId: user.uid,
+          memberId: cleanMemberId,
           updatedAt: new Date().toISOString(),
         });
       }
@@ -244,6 +253,9 @@ export async function initUserProfile(
       if (googleEmail && existing.email !== googleEmail) {
         updates.email = googleEmail;
       }
+      if (user.emailVerified === true && existing.emailVerified !== true) {
+        updates.emailVerified = true;
+      }
 
       // Automatically upgrade cuanteknologi01@gmail.com to admin role
       if (isAdminUser) {
@@ -256,13 +268,15 @@ export async function initUserProfile(
       }
 
       let activeMemberId = existing.memberId;
-      if (!activeMemberId || !activeMemberId.startsWith('GN-')) {
-        activeMemberId = isAdminUser ? 'GN-00001' : generateCleanMemberId(user.uid);
+      if (!isValidMemberId(activeMemberId)) {
+        activeMemberId = cleanMemberId;
         updates.memberId = activeMemberId;
       }
       if (!existing.sponsorId) {
-        updates.sponsorId = 'GN-10001';
-        updates.sponsorName = 'Master GAIN Foundation';
+        if (registrationData?.sponsorId) {
+          updates.sponsorId = registrationData.sponsorId;
+          updates.sponsorName = registrationData.sponsorName || '';
+        }
       }
 
       if (Object.keys(updates).length > 0) {
@@ -278,8 +292,8 @@ export async function initUserProfile(
         emailMasked: googleEmail
           ? `${googleEmail.slice(0, 3)}***@${googleEmail.split('@')[1] || 'gmail.com'}`
           : 'user***@gmail.com',
-        sponsorId: existing.sponsorId || 'GN-10001',
-        sponsorName: existing.sponsorName || 'Master GAIN Foundation',
+        sponsorId: existing.sponsorId || registrationData?.sponsorId || '',
+        sponsorName: existing.sponsorName || registrationData?.sponsorName || '',
         joinedAt: existing.createdAt || new Date().toISOString(),
       });
     }
@@ -792,6 +806,9 @@ export async function addTransactionToFirestore(userId: string, tx: TransactionR
     throw new Error('Client-side transaction ledger mutation is disabled in production. Use the server-authoritative wallet API.');
   }
 
+  const memberId = await requireMemberId(userId);
+  const transaction = { ...tx, memberId };
+
   if (typeof window !== 'undefined' && userId) {
     const localKey = `gain_transactions_${userId}`;
     const raw = localStorage.getItem(localKey);
@@ -799,7 +816,7 @@ export async function addTransactionToFirestore(userId: string, tx: TransactionR
     if (raw) {
       try { list = JSON.parse(raw); } catch {}
     }
-    list = [tx, ...list.filter((t) => t.id !== tx.id)];
+    list = [transaction, ...list.filter((t) => t.id !== tx.id)];
     localStorage.setItem(localKey, JSON.stringify(list));
   }
 
@@ -808,7 +825,7 @@ export async function addTransactionToFirestore(userId: string, tx: TransactionR
   try {
     const txRef = doc(db, 'users', userId, 'transactions', tx.id);
     await setDoc(txRef, {
-      ...tx,
+      ...transaction,
       userId,
       createdAt: new Date().toISOString(),
       sourceAction: tx.sourceAction || 'transaction',
@@ -824,6 +841,9 @@ export async function updatePositionInFirestore(userId: string, pos: TradingPosi
     throw new Error('Client-side position mutation is disabled in production. Use the server-authoritative wallet API.');
   }
 
+  const memberId = await requireMemberId(userId);
+  const position = { ...pos, memberId };
+
   if (typeof window !== 'undefined' && userId) {
     const localKey = `gain_positions_${userId}`;
     const raw = localStorage.getItem(localKey);
@@ -831,18 +851,18 @@ export async function updatePositionInFirestore(userId: string, pos: TradingPosi
     if (raw) {
       try { list = JSON.parse(raw); } catch {}
     }
-    const idx = list.findIndex((p) => p.id === pos.id);
-    if (idx >= 0) list[idx] = pos;
-    else list.push(pos);
+    const idx = list.findIndex((p) => p.id === position.id);
+    if (idx >= 0) list[idx] = position;
+    else list.push(position);
     localStorage.setItem(localKey, JSON.stringify(list));
   }
 
   if (!auth.currentUser || !userId || userId.startsWith('usr-') || auth.currentUser.uid !== userId) return;
-  const path = `users/${userId}/positions/${pos.id}`;
+  const path = `users/${userId}/positions/${position.id}`;
   try {
-    const posRef = doc(db, 'users', userId, 'positions', pos.id);
+    const posRef = doc(db, 'users', userId, 'positions', position.id);
     await setDoc(posRef, {
-      ...pos,
+      ...position,
       userId,
       updatedAt: new Date().toISOString(),
     });
@@ -944,12 +964,14 @@ export async function fetchOlderUserTrades(
 
 export async function addTradeRecordToFirestore(userId: string, trade: TradeRecord) {
   if (!auth.currentUser || !userId || userId.startsWith('usr-') || auth.currentUser.uid !== userId) return;
+  const memberId = await requireMemberId(userId);
   const path = `users/${userId}/trade_history/${trade.id}`;
   try {
     const tradeRef = doc(db, 'users', userId, 'trade_history', trade.id);
     await setDoc(tradeRef, {
       ...trade,
       userId,
+      memberId,
       createdAt: new Date().toISOString(),
     });
   } catch (error) {
@@ -961,6 +983,7 @@ export async function addTradeRecordToFirestore(userId: string, trade: TradeReco
 export async function syncTradesFromExchangeToFirestore(userId: string, trades: TradeRecord[]) {
   if (!auth.currentUser || !userId || userId.startsWith('usr-') || auth.currentUser.uid !== userId) return;
   try {
+    const memberId = await requireMemberId(userId);
     for (const trade of trades) {
       const tradeRef = doc(db, 'users', userId, 'trade_history', trade.id);
       await setDoc(
@@ -968,6 +991,7 @@ export async function syncTradesFromExchangeToFirestore(userId: string, trades: 
         {
           ...trade,
           userId,
+          memberId,
           updatedAt: new Date().toISOString(),
         },
         { merge: true }

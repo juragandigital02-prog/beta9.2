@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
-import { X, Send, ShieldCheck, CheckCircle2, AlertTriangle, Users, Mail } from 'lucide-react';
-import { lookupMemberInDirectory, DEFAULT_DIRECTORY_MEMBERS } from '../../services/memberService';
+import { X, Send, ShieldCheck, CheckCircle2, AlertTriangle, Mail } from 'lucide-react';
+import { lookupMemberInDirectory } from '../../services/memberService';
 import { verifyTotp } from '../../services/totpService';
 import { formatUsdt } from '../../utils/formatters';
 import { requestEmailVerificationCode } from '../../services/authService';
@@ -25,11 +25,11 @@ export function TransferMemberModal({
   userEmail,
   onTransferSuccess,
 }: TransferMemberModalProps) {
-  const [recipientId, setRecipientId] = useState('GN-20419');
-  const [verifiedName, setVerifiedName] = useState('tera_areh');
-  const [verifiedStatus, setVerifiedStatus] = useState<'ACTIVE' | 'NON-ACTIVE'>('ACTIVE');
+  const [recipientId, setRecipientId] = useState('');
+  const [verifiedName, setVerifiedName] = useState('');
+  const [verifiedStatus, setVerifiedStatus] = useState<'ACTIVE' | 'NON-ACTIVE'>('NON-ACTIVE');
   const [isChecking, setIsChecking] = useState(false);
-  const [checkStatus, setCheckStatus] = useState<'verified' | 'not_found' | 'idle'>('verified');
+  const [checkStatus, setCheckStatus] = useState<'verified' | 'not_found' | 'idle'>('idle');
   const [amount, setAmount] = useState('15.00');
   const [note, setNote] = useState('');
   const [otp2fa, setOtp2fa] = useState('');
@@ -72,25 +72,10 @@ export function TransferMemberModal({
     }
   };
 
-  const quickContacts = [
-    { id: 'GN-20419', name: 'tera_areh', status: 'ACTIVE' as const },
-    { id: 'GN-31952', name: 'wGLmfcbq', status: 'ACTIVE' as const },
-    { id: 'GN-45812', name: 'Budi Santoso', status: 'NON-ACTIVE' as const },
-    { id: 'GN-10001', name: 'Master GAIN', status: 'ACTIVE' as const },
-  ];
-
-  const handleSelectContact = (contact: { id: string; name: string; status: 'ACTIVE' | 'NON-ACTIVE' }) => {
-    setRecipientId(contact.id);
-    setVerifiedName(contact.name);
-    setVerifiedStatus(contact.status);
-    setCheckStatus('verified');
-    setErrorMsg('');
-  };
-
   const handleCheckMember = async () => {
     const query = recipientId.trim().toUpperCase();
     if (!query) {
-      setErrorMsg('Masukkan ID Member (contoh: GN-10823).');
+      setErrorMsg('Masukkan ID Member (contoh: GN-00001).');
       return;
     }
 
@@ -267,28 +252,6 @@ export function TransferMemberModal({
               </div>
             )}
 
-            {/* Quick Contacts Chips */}
-            <div className="flex items-center gap-2 mt-2">
-              <span className="text-[10px] text-slate-500 font-mono flex items-center gap-1">
-                <Users className="w-3 h-3" /> Kontak:
-              </span>
-              <div className="flex flex-wrap gap-1.5">
-                {quickContacts.map((c) => (
-                  <button
-                    key={c.id}
-                    type="button"
-                    onClick={() => handleSelectContact(c)}
-                    className={`px-2 py-0.5 rounded-md text-[10px] font-mono transition ${
-                      recipientId === c.id
-                        ? 'bg-[#00F0C8]/20 text-[#00F0C8] border border-[#00F0C8]/40'
-                        : 'bg-[#0E1A2C] text-slate-400 hover:text-white border border-[#162740]'
-                    }`}
-                  >
-                    {c.name}
-                  </button>
-                ))}
-              </div>
-            </div>
           </div>
 
           {/* Amount Transfer */}

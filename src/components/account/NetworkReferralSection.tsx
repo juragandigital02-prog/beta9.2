@@ -16,8 +16,7 @@ import {
   ArrowUpRight,
 } from 'lucide-react';
 import { UserWallet, NetworkMember } from '../../types';
-import { fetchUserNetworkPage, lookupMemberInDirectory } from '../../services/memberService';
-import type { NetworkCursor } from '../../services/memberService';
+import { subscribeToDirectReferrals } from '../../services/memberService';
 
 interface NetworkReferralSectionProps {
   wallet: UserWallet;
@@ -42,9 +41,7 @@ export function NetworkReferralSection({
   const [filterStatus, setFilterStatus] = useState<'all' | 'active' | 'non-active'>('all');
   const [networkList, setNetworkList] = useState<NetworkMember[]>([]);
   const [isLoading, setIsLoading] = useState(true);
-  const [isLoadingMoreNetwork, setIsLoadingMoreNetwork] = useState(false);
-  const [networkCursor, setNetworkCursor] = useState<NetworkCursor | null>(null);
-  const [hasMoreNetwork, setHasMoreNetwork] = useState(false);
+  const [networkError, setNetworkError] = useState(false);
   const [showQrModal, setShowQrModal] = useState(false);
 
   const referralLink = `https://gainkoin.io/register?ref=${wallet.memberId}`;
@@ -52,37 +49,27 @@ export function NetworkReferralSection({
   useEffect(() => {
     let isMounted = true;
     setIsLoading(true);
-    setNetworkCursor(null);
-    setHasMoreNetwork(false);
-    fetchUserNetworkPage(userId, wallet.memberId).then((page) => {
-      if (isMounted) {
-        setNetworkList(page.members);
-        setNetworkCursor(page.cursor);
-        setHasMoreNetwork(page.hasMore);
+    setNetworkError(false);
+    const unsubscribe = subscribeToDirectReferrals(
+      userId,
+      wallet.memberId,
+      (members) => {
+        if (!isMounted) return;
+        setNetworkList(members);
         setIsLoading(false);
-      }
-    });
+      },
+      () => {
+        if (!isMounted) return;
+        setNetworkError(true);
+        setNetworkList([]);
+        setIsLoading(false);
+      },
+    );
     return () => {
       isMounted = false;
+      unsubscribe();
     };
   }, [userId, wallet.memberId]);
-
-  const handleLoadMoreNetwork = async () => {
-    if (!userId || !networkCursor || isLoadingMoreNetwork) return;
-    setIsLoadingMoreNetwork(true);
-    try {
-      const page = await fetchUserNetworkPage(userId, wallet.memberId, networkCursor);
-      setNetworkList((previous) => {
-        const members = new Map(previous.map((member) => [member.id, member]));
-        page.members.forEach((member) => members.set(member.id, member));
-        return Array.from(members.values());
-      });
-      setNetworkCursor(page.cursor);
-      setHasMoreNetwork(page.hasMore);
-    } finally {
-      setIsLoadingMoreNetwork(false);
-    }
-  };
 
   const copyReferral = () => {
     navigator.clipboard.writeText(referralLink);
@@ -117,8 +104,12 @@ export function NetworkReferralSection({
 
   const directCount = networkList.length;
   const activeCount = networkList.filter((m) => m.accountStatus === 'active').length;
-  const totalBonus = wallet.totalReferralBonusUsdt ?? networkList.reduce((acc, m) => acc + m.bonusYieldUsdt, 0);
-  const teamTurnover = wallet.teamTurnoverUsdt ?? networkList.reduce((acc, m) => acc + m.totalTurnoverUsdt, 0);
+  const totalBonus = networkList.every((member) => typeof member.bonusYieldUsdt === 'number')
+    ? networkList.reduce((total, member) => total + (member.bonusYieldUsdt || 0), 0)
+    : null;
+  const teamTurnover = networkList.every((member) => typeof member.totalTurnoverUsdt === 'number')
+    ? networkList.reduce((total, member) => total + (member.totalTurnoverUsdt || 0), 0)
+    : null;
 
   return (
     <div className="theme-surface theme-legacy-surface p-4 rounded-2xl bg-[#08101D] border border-[#162740] shadow-xl space-y-4 transition-colors">
@@ -191,10 +182,10 @@ export function NetworkReferralSection({
             </span>
             <div className="flex items-center gap-1.5 mt-0.5">
               <span className="font-mono text-xs font-bold text-white">
-                {wallet.sponsorId || 'GN-10001'}
+                {wallet.sponsorId || '-'}
               </span>
               <span className="text-[11px] text-slate-400 truncate max-w-[110px]">
-                ({wallet.sponsorName || 'Master GAIN'})
+                ({wallet.sponsorName || (wallet.sponsorId ? 'Sponsor' : 'Tidak ada sponsor')})
               </span>
             </div>
           </div>
@@ -226,7 +217,7 @@ export function NetworkReferralSection({
         <div className="p-2.5 rounded-xl bg-[#060B14] border border-[#121E31]">
           <span className="text-[10px] text-slate-500 uppercase block">Bonus Sponsor</span>
           <span className="text-amber-400 text-sm font-bold block mt-0.5">
-            +{totalBonus.toFixed(2)}
+            {totalBonus === null ? 'Belum tersedia' : `+${totalBonus.toFixed(2)}`}
           </span>
           <span className="text-[9px] text-slate-400 block mt-0.5">USDT Gas Fee Share</span>
         </div>
@@ -234,7 +225,7 @@ export function NetworkReferralSection({
         <div className="p-2.5 rounded-xl bg-[#060B14] border border-[#121E31]">
           <span className="text-[10px] text-slate-500 uppercase block">Omzet Trading</span>
           <span className="text-blue-400 text-sm font-bold block mt-0.5">
-            {teamTurnover.toLocaleString('id-ID')}
+            {teamTurnover === null ? 'Belum tersedia' : teamTurnover.toLocaleString('id-ID')}
           </span>
           <span className="text-[9px] text-slate-400 block mt-0.5">USDT Spot</span>
         </div>
@@ -369,7 +360,15 @@ export function NetworkReferralSection({
 
         {/* Member Cards */}
         <div className="space-y-2">
-          {filteredNetwork.map((m) => (
+          {isLoading ? (
+            <p className="py-5 text-center text-xs text-slate-400">Memuat data mitra...</p>
+          ) : networkError ? (
+            <p className="py-5 text-center text-xs text-rose-300">Data mitra tidak dapat dimuat. Periksa koneksi atau aturan akses Firestore.</p>
+          ) : filteredNetwork.length === 0 ? (
+            <p className="py-5 text-center text-xs text-slate-400">
+              {networkList.length === 0 ? 'Belum ada mitra langsung yang terdaftar.' : 'Tidak ada mitra pada filter ini.'}
+            </p>
+          ) : filteredNetwork.map((m) => (
             <div
               key={m.id}
               className="p-3 rounded-xl bg-[#060B14] border border-[#14233A] hover:border-[#1E3658] transition flex flex-col sm:flex-row sm:items-center justify-between gap-2.5"
@@ -394,7 +393,7 @@ export function NetworkReferralSection({
                     <span>Gabung: {m.joinDate}</span>
                     <span>•</span>
                     <span className={m.botStatus === 'ACTIVE' ? 'text-emerald-400' : 'text-slate-400'}>
-                      {m.botStatus === 'ACTIVE' ? 'Bot Aktif (Spot)' : 'Standby'}
+                      {m.botStatus === 'ACTIVE' ? 'Bot Aktif' : m.botStatus === 'STANDBY' ? 'Standby' : 'Data bot belum tersedia'}
                     </span>
                   </div>
                 </div>
@@ -405,7 +404,7 @@ export function NetworkReferralSection({
                 <div className="text-left sm:text-right">
                   <span className="text-[9px] text-slate-500 block uppercase">Bonus Sponsor</span>
                   <span className="text-xs font-bold text-emerald-400 block">
-                    +{m.bonusYieldUsdt.toFixed(2)} USDT
+                    {typeof m.bonusYieldUsdt === 'number' ? `+${m.bonusYieldUsdt.toFixed(2)} USDT` : 'Belum tersedia'}
                   </span>
                 </div>
 
@@ -423,19 +422,6 @@ export function NetworkReferralSection({
             </div>
           ))}
         </div>
-        {hasMoreNetwork && (
-          <div className="flex justify-center pt-1">
-            <button
-              type="button"
-              onClick={handleLoadMoreNetwork}
-              disabled={isLoadingMoreNetwork}
-              className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg border border-[#182B48] text-[11px] text-slate-300 hover:bg-[#0E1A2C] disabled:opacity-50"
-            >
-              {isLoadingMoreNetwork && <ChevronRight className="w-3 h-3 animate-pulse" />}
-              {isLoadingMoreNetwork ? 'Memuat...' : 'Muat mitra lainnya'}
-            </button>
-          </div>
-        )}
       </div>
 
       {/* QR Code Modal */}

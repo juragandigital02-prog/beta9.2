@@ -33,7 +33,7 @@ export function AuthModal({
   isOpen,
   onClose,
   defaultMode = 'login',
-  initialSponsorId = 'GN-10001',
+  initialSponsorId = '',
 }: AuthModalProps) {
   const {
     loginWithGoogle,
@@ -87,14 +87,8 @@ export function AuthModal({
   useEffect(() => {
     const trimmed = sponsorId.trim().toUpperCase();
     if (!trimmed) {
-      setSponsorStatus('invalid');
-      setSponsorName('Kode referral / ID upline wajib diisi');
-      return;
-    }
-
-    if (trimmed === 'GN-10001') {
       setSponsorStatus('valid');
-      setSponsorName('Master GAIN Foundation (Default)');
+      setSponsorName('');
       return;
     }
 
@@ -113,8 +107,8 @@ export function AuthModal({
         }
       } catch {
         if (isMounted) {
-          setSponsorStatus('valid');
-          setSponsorName('Upline Referral Member');
+          setSponsorStatus('invalid');
+          setSponsorName('Direktori referral tidak dapat diverifikasi');
         }
       } finally {
         if (isMounted) setIsVerifyingSponsor(false);
@@ -463,7 +457,7 @@ export function AuthModal({
                 <input
                   type="text"
                   required
-                  placeholder="GN-10001"
+                  placeholder="GN-00001"
                   value={sponsorId}
                   onChange={(e) => setSponsorId(e.target.value)}
                   className={`w-full px-3.5 py-2.5 bg-[#060B14] border rounded-xl text-white font-mono text-xs uppercase tracking-wider focus:outline-none transition ${

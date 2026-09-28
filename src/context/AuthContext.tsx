@@ -10,6 +10,7 @@ interface AuthContextType {
   loading: boolean;
   loginWithGoogle: (registrationData?: { sponsorId?: string; sponsorName?: string; desiredUsername?: string }) => Promise<void>;
   loginDirectly: (email: string, registrationData?: { sponsorId?: string; sponsorName?: string; desiredUsername?: string }) => Promise<void>;
+  retryUserProfileSync: () => Promise<void>;
   logout: () => Promise<void>;
   isFirebaseConnected: boolean;
   isLoggingIn: boolean;
@@ -38,6 +39,7 @@ const AuthContext = createContext<AuthContextType>({
   loading: true,
   loginWithGoogle: async () => {},
   loginDirectly: async () => {},
+  retryUserProfileSync: async () => {},
   logout: async () => {},
   isFirebaseConnected: false,
   isLoggingIn: false,
@@ -153,6 +155,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         const userObj = {
           uid: user.uid,
           displayName: user.displayName,
+          email: user.email,
+          emailVerified: user.emailVerified,
         } as any;
         setCurrentUser(userObj);
         if (typeof window !== 'undefined') {
@@ -180,6 +184,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         const userObj = {
           uid: res.user.uid,
           displayName: res.user.displayName,
+          email: res.user.email,
+          emailVerified: res.user.emailVerified,
         } as any;
         setCurrentUser(userObj);
         if (typeof window !== 'undefined') {
@@ -218,6 +224,20 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setAuthError({ code: 'auth/direct-login-error', message: err?.message || 'Login langsung gagal' });
     } finally {
       setIsLoggingIn(false);
+    }
+  };
+
+  const retryUserProfileSync = async () => {
+    if (!currentUser || auth.currentUser?.uid !== currentUser.uid) {
+      throw new Error('Sesi Firebase belum siap. Silakan muat ulang halaman lalu coba lagi.');
+    }
+    setAuthError(null);
+    try {
+      await initUserProfile(currentUser);
+    } catch (err: any) {
+      const message = err?.message || 'Member ID belum dapat disinkronkan.';
+      setAuthError({ code: 'member-id/sync-failed', message });
+      throw err;
     }
   };
 
@@ -274,6 +294,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         loading,
         loginWithGoogle,
         loginDirectly,
+        retryUserProfileSync,
         logout,
         isFirebaseConnected,
         isLoggingIn,

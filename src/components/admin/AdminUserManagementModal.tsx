@@ -12,7 +12,8 @@ import {
   Fuel,
   TrendingUp,
 } from 'lucide-react';
-import { DEFAULT_DIRECTORY_MEMBERS, DirectoryMember } from '../../services/memberService';
+import { subscribeToMemberDirectory } from '../../services/memberService';
+import type { DirectoryMember } from '../../services/memberService';
 import { formatUsdt } from '../../utils/formatters';
 
 interface AdminUserManagementModalProps {
@@ -21,9 +22,19 @@ interface AdminUserManagementModalProps {
 }
 
 export function AdminUserManagementModal({ isOpen, onClose }: AdminUserManagementModalProps) {
-  const [members, setMembers] = useState<DirectoryMember[]>(DEFAULT_DIRECTORY_MEMBERS);
+  const [members, setMembers] = useState<DirectoryMember[]>([]);
+  const [loadError, setLoadError] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
   const [filterStatus, setFilterStatus] = useState<'all' | 'active' | 'non-active'>('all');
+
+  useEffect(() => {
+    if (!isOpen) return;
+    setLoadError(false);
+    return subscribeToMemberDirectory(setMembers, () => {
+      setMembers([]);
+      setLoadError(true);
+    });
+  }, [isOpen]);
 
   if (!isOpen) return null;
 
@@ -115,6 +126,12 @@ export function AdminUserManagementModal({ isOpen, onClose }: AdminUserManagemen
         {/* Member Table */}
         <div className="flex-1 overflow-y-auto p-4">
           <div className="space-y-2">
+            {loadError && (
+              <p className="py-5 text-center text-xs text-rose-300">Direktori tidak dapat dimuat. Periksa aturan akses Firestore.</p>
+            )}
+            {!loadError && filteredMembers.length === 0 && (
+              <p className="py-5 text-center text-xs text-slate-400">Belum ada data member di direktori.</p>
+            )}
             {filteredMembers.map((member) => {
               const isActive = member.accountStatus === 'active';
               return (

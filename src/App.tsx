@@ -1463,12 +1463,6 @@ function AppContent() {
       ...prev,
       emailVerified: true,
     }));
-
-    if (currentUser) {
-      await updateUserWallet(currentUser.uid, {
-        emailVerified: true,
-      });
-    }
   };
 
   // Secure Account Activation with Backend License Verification
@@ -1575,23 +1569,6 @@ function AppContent() {
       return Array.from(map.values());
     });
 
-    if (currentUser) {
-      await updateUserWallet(currentUser.uid, {
-        liquidBalance: newLiquidBalance,
-        gasReserve: newGasReserve,
-        totalOutflow: newOutflow,
-        totalInflow: newInflow,
-        accountStatus: 'active',
-        licenseTier: tier,
-        licenseType: 'lifetime',
-        licenseName,
-        maxActiveBots: maxBots,
-        tradingBonusUsdt: (wallet.tradingBonusUsdt || 0) + tradingBonus,
-        activationFeeUsdt: (wallet.activationFeeUsdt || 0) + requiredFee,
-      });
-      await addTransactionToFirestore(currentUser.uid, newTx);
-      await addTransactionToFirestore(currentUser.uid, bonusTx);
-    }
   };
 
   const handleDepositSuccess = async (amount: number, target: 'gas' | 'vault', txHash: string) => {

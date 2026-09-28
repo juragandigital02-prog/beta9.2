@@ -22,6 +22,10 @@ service cloud.firestore {
       return isOwner(userId) && request.resource.data.userId == userId;
     }
 
+    function currentMemberId() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.memberId;
+    }
+
     function hasOnlyPublicMemberFields() {
       return request.resource.data.keys().hasOnly([
         'memberId',
@@ -44,11 +48,62 @@ service cloud.firestore {
       allow write: if false;
     }
 
+    match /system/member_id_counter {
+      allow get: if isSignedIn();
+      allow create: if isSignedIn()
+        && request.resource.data.keys().hasOnly(['value'])
+        && request.resource.data.value is int
+        && request.resource.data.value > 0
+        && getAfter(/databases/$(database)/documents/member_id_reservations/$(request.auth.uid)).data.sequence == request.resource.data.value;
+      allow update: if isSignedIn()
+        && request.resource.data.keys().hasOnly(['value'])
+        && request.resource.data.value == resource.data.value + 1
+        && getAfter(/databases/$(database)/documents/member_id_reservations/$(request.auth.uid)).data.sequence == request.resource.data.value;
+      allow list, delete: if false;
+    }
+
+    match /member_id_reservations/{userId} {
+      allow get: if isOwner(userId) || isAdmin();
+      allow list: if isAdmin();
+      allow create: if isOwner(userId)
+        && request.resource.data.keys().hasOnly(['userId', 'memberId', 'sequence', 'createdAt'])
+        && request.resource.data.userId == userId
+        && request.resource.data.memberId is string
+        && request.resource.data.memberId.matches('GN-[0-9]{5}')
+        && request.resource.data.sequence is int
+        && !exists(/databases/$(database)/documents/member_directory/$(request.resource.data.memberId));
+      allow update, delete: if false;
+    }
+
+    match /member_id_index/{memberId} {
+      allow get: if isSignedIn();
+      allow list: if isAdmin();
+      allow create: if isOwner(request.resource.data.userId)
+        && request.resource.data.keys().hasOnly(['userId', 'memberId', 'sequence'])
+        && request.resource.data.memberId == memberId
+        && request.resource.data.memberId.matches('GN-[0-9]{5}')
+        && request.resource.data.sequence is int
+        && getAfter(/databases/$(database)/documents/member_id_reservations/$(request.resource.data.userId)).data.memberId == memberId
+        && !exists(/databases/$(database)/documents/member_id_index/$(memberId));
+      allow update, delete: if false;
+    }
+
     match /users/{userId} {
       allow get: if isOwner(userId) || isAdmin();
       allow list: if isAdmin();
-      allow create: if isOwner(userId) && request.resource.data.id == userId;
-      allow update: if isOwner(userId) && request.resource.data.id == userId;
+      allow create: if isOwner(userId)
+        && request.resource.data.id == userId
+        && request.resource.data.memberId is string
+        && request.resource.data.memberId.matches('GN-[0-9]{5}')
+        && get(/databases/$(database)/documents/member_id_reservations/$(userId)).data.memberId == request.resource.data.memberId
+        && get(/databases/$(database)/documents/member_id_index/$(request.resource.data.memberId)).data.userId == userId;
+      allow update: if isOwner(userId)
+        && request.resource.data.id == userId
+        && (request.resource.data.memberId == resource.data.memberId
+          || ((!resource.data.keys().hasAny(['memberId'])
+            || !(resource.data.memberId is string)
+            || !resource.data.memberId.matches('GN-[0-9]{5}'))
+            && get(/databases/$(database)/documents/member_id_reservations/$(userId)).data.memberId == request.resource.data.memberId));
       allow delete: if isAdmin();
 
       match /positions/{positionId} {
@@ -95,9 +150,12 @@ service cloud.firestore {
     match /member_directory/{memberId} {
       allow get: if isSignedIn()
         && !resource.data.keys().hasAny(['emailFull', 'liquidBalance', 'gasReserve', 'depositAddress', 'role']);
-      allow list: if false;
+      allow list: if isAdmin()
+        || (isSignedIn() && resource.data.sponsorId == currentMemberId());
       allow create: if isOwner(request.resource.data.userId)
         && request.resource.data.memberId == memberId
+        && (get(/databases/$(database)/documents/member_id_reservations/$(request.resource.data.userId)).data.memberId == memberId
+          || get(/databases/$(database)/documents/users/$(request.resource.data.userId)).data.memberId == memberId)
         && hasOnlyPublicMemberFields();
       allow update: if isOwner(resource.data.userId)
         && request.resource.data.userId == resource.data.userId

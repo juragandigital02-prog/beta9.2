@@ -4,6 +4,7 @@ import path from 'path';
 import { createServer as createViteServer } from 'vite';
 import dotenv from 'dotenv';
 import ccxt from 'ccxt';
+import { createHash, randomInt, timingSafeEqual } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import firebaseAppletConfig from './firebase-applet-config.json';
 
@@ -21,6 +22,10 @@ const circuitBreakerMap = new Map<string, { failures: number; openedAt: number; 
 const ALLOWED_CORS_ORIGINS = new Set(['http://localhost:3000', 'http://127.0.0.1:3000', 'https://localhost:3000', 'https://127.0.0.1:3000']);
 const IS_DEVELOPMENT = process.env.NODE_ENV !== 'production';
 const FIREBASE_AUTH_DOMAIN = (process.env.VITE_FIREBASE_AUTH_DOMAIN || firebaseAppletConfig.authDomain).replace(/^https?:\/\//, '');
+const FIREBASE_API_KEY = process.env.VITE_FIREBASE_API_KEY || firebaseAppletConfig.apiKey;
+const FIREBASE_PROJECT_ID = process.env.VITE_FIREBASE_PROJECT_ID || firebaseAppletConfig.projectId;
+const FIRESTORE_DATABASE_ID = process.env.VITE_FIREBASE_DATABASE_ID || firebaseAppletConfig.firestoreDatabaseId || '(default)';
+const emailVerificationChallenges = new Map<string, { codeHash: string; expiresAt: number; attempts: number; sentAt: number }>();
 const SECURITY_CSP = [
   "default-src 'self'",
   "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
@@ -68,6 +73,87 @@ class ApiError extends Error {
     this.category = category;
     this.userMessage = userMessage;
   }
+}
+
+interface FirebaseIdentity {
+  uid: string;
+  email: string;
+  emailVerified: boolean;
+}
+
+function hashVerificationCode(code: string): string {
+  return createHash('sha256').update(code).digest('hex');
+}
+
+async function requireFirebaseIdentity(req: Request): Promise<{ identity: FirebaseIdentity; idToken: string }> {
+  const authorization = req.header('authorization') || '';
+  const idToken = authorization.startsWith('Bearer ') ? authorization.slice(7) : '';
+  if (!idToken || !FIREBASE_API_KEY) {
+    throw new ApiError(401, 'AUTH_REQUIRED', 'authentication', 'A valid Firebase sign-in is required.', 'Silakan login ulang dengan akun Firebase yang valid.');
+  }
+
+  const response = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${encodeURIComponent(FIREBASE_API_KEY)}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ idToken }),
+  });
+  const payload = await response.json().catch(() => null) as { users?: Array<{ localId?: string; email?: string; emailVerified?: boolean }> } | null;
+  const user = payload?.users?.[0];
+  if (!response.ok || !user?.localId || !user.email) {
+    throw new ApiError(401, 'AUTH_INVALID', 'authentication', 'Firebase sign-in token is invalid or expired.', 'Sesi login berakhir. Silakan login ulang.');
+  }
+
+  return {
+    idToken,
+    identity: { uid: user.localId, email: user.email, emailVerified: user.emailVerified === true },
+  };
+}
+
+function firestoreDocumentName(documentPath: string): string {
+  return `projects/${FIREBASE_PROJECT_ID}/databases/${encodeURIComponent(FIRESTORE_DATABASE_ID)}/documents/${documentPath}`;
+}
+
+function toFirestoreValue(value: unknown): Record<string, unknown> {
+  if (value === null) return { nullValue: null };
+  if (typeof value === 'boolean') return { booleanValue: value };
+  if (typeof value === 'number') return Number.isInteger(value) ? { integerValue: String(value) } : { doubleValue: value };
+  if (typeof value === 'string') return { stringValue: value };
+  if (Array.isArray(value)) return { arrayValue: { values: value.map(toFirestoreValue) } };
+  if (typeof value === 'object') {
+    return { mapValue: { fields: Object.fromEntries(Object.entries(value).map(([key, item]) => [key, toFirestoreValue(item)])) } };
+  }
+  return { nullValue: null };
+}
+
+function toFirestoreFields(record: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(record).map(([key, value]) => [key, toFirestoreValue(value)]));
+}
+
+function firestoreNumber(value: any): number {
+  return Number(value?.doubleValue ?? value?.integerValue ?? 0);
+}
+
+async function firestoreRequest(idToken: string, endpoint: string, init: RequestInit = {}, allowNotFound = false): Promise<any> {
+  const response = await fetch(`https://firestore.googleapis.com/v1/${endpoint}`, {
+    ...init,
+    headers: {
+      Authorization: `Bearer ${idToken}`,
+      'Content-Type': 'application/json',
+      ...init.headers,
+    },
+  });
+  const payload = await response.json().catch(() => null);
+  if (response.status === 404 && allowNotFound) return null;
+  if (!response.ok) {
+    const statusCode = response.status === 403 ? 403 : 502;
+    throw new ApiError(statusCode, 'FIRESTORE_OPERATION_FAILED', 'upstream', 'Firestore rejected the requested wallet update.', 'Data akun tidak dapat diperbarui. Periksa aturan Firestore dan coba lagi.');
+  }
+  return payload;
+}
+
+async function commitFirestoreWrites(idToken: string, writes: unknown[]): Promise<void> {
+  const endpoint = `projects/${FIREBASE_PROJECT_ID}/databases/${encodeURIComponent(FIRESTORE_DATABASE_ID)}/documents:commit`;
+  await firestoreRequest(idToken, endpoint, { method: 'POST', body: JSON.stringify({ writes }) });
 }
 
 function isDemoCredential(value?: string): boolean {
@@ -349,6 +435,102 @@ app.get('/api/health', (_req: Request, res: Response) => {
     },
     timestamp: new Date().toISOString(),
   });
+});
+
+app.post('/api/auth/send-verification-code', async (req: Request, res: Response, next) => {
+  try {
+    const { identity } = await requireFirebaseIdentity(req);
+    const resendApiKey = process.env.RESEND_API_KEY;
+    const from = process.env.RESEND_FROM || process.env.SMTP_FROM;
+    if (!resendApiKey || !from) {
+      return next(new ApiError(503, 'EMAIL_DELIVERY_NOT_CONFIGURED', 'configuration', 'Email delivery is not configured.', 'Pengiriman email belum dikonfigurasi. Hubungi administrator aplikasi.'));
+    }
+
+    const previous = emailVerificationChallenges.get(identity.uid);
+    if (previous && Date.now() - previous.sentAt < 30_000) {
+      return next(new ApiError(429, 'VERIFICATION_RATE_LIMITED', 'rate_limit', 'A verification email was sent recently.', 'Tunggu 30 detik sebelum meminta kode baru.'));
+    }
+
+    const code = String(randomInt(0, 1_000_000)).padStart(6, '0');
+    const deliveryResponse = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${resendApiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        from,
+        to: [identity.email],
+        subject: 'Kode verifikasi GAIN Niaga Koin',
+        text: `Kode verifikasi Anda: ${code}\n\nKode berlaku selama 10 menit. Jangan bagikan kode ini kepada siapa pun.`,
+      }),
+    });
+
+    if (!deliveryResponse.ok) {
+      const providerError = await deliveryResponse.json().catch(() => null) as { name?: unknown; message?: unknown } | null;
+      console.error('[EMAIL_DELIVERY_FAILED]', {
+        status: deliveryResponse.status,
+        providerCode: typeof providerError?.name === 'string' ? providerError.name.slice(0, 64) : undefined,
+        uid: identity.uid,
+      });
+      if (deliveryResponse.status === 401) {
+        return next(new ApiError(503, 'RESEND_API_KEY_REJECTED', 'configuration', 'Resend rejected the API key.', 'Resend menolak RESEND_API_KEY. Buat atau salin API key Resend yang aktif ke environment server, lalu restart server.'));
+      }
+      if (deliveryResponse.status === 403) {
+        return next(new ApiError(503, 'RESEND_SENDER_NOT_ALLOWED', 'configuration', 'Resend rejected the configured sender.', 'Resend menolak alamat pengirim. Gunakan domain/alamat yang sudah diverifikasi di Resend.'));
+      }
+      return next(new ApiError(502, 'EMAIL_DELIVERY_FAILED', 'upstream', 'Email provider rejected the verification message.', 'Email gagal dikirim. Periksa konfigurasi pengirim email, lalu coba lagi.'));
+    }
+
+    emailVerificationChallenges.set(identity.uid, {
+      codeHash: hashVerificationCode(code),
+      expiresAt: Date.now() + 10 * 60_000,
+      attempts: 0,
+      sentAt: Date.now(),
+    });
+    res.json({ success: true, expiresInSeconds: 600 });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+app.post('/api/auth/verify-email-code', async (req: Request, res: Response, next) => {
+  try {
+    const { identity, idToken } = await requireFirebaseIdentity(req);
+    const challenge = emailVerificationChallenges.get(identity.uid);
+    const code = typeof req.body?.code === 'string' ? req.body.code.trim() : '';
+    if (!challenge || Date.now() > challenge.expiresAt || challenge.attempts >= 5) {
+      emailVerificationChallenges.delete(identity.uid);
+      return next(new ApiError(400, 'VERIFICATION_CODE_EXPIRED', 'validation', 'Verification code is missing or expired.', 'Kode tidak ditemukan atau sudah kedaluwarsa. Minta kode baru.'));
+    }
+
+    const suppliedHash = Buffer.from(hashVerificationCode(code), 'hex');
+    const expectedHash = Buffer.from(challenge.codeHash, 'hex');
+    if (!/^\d{6}$/.test(code) || suppliedHash.length !== expectedHash.length || !timingSafeEqual(suppliedHash, expectedHash)) {
+      challenge.attempts += 1;
+      if (challenge.attempts >= 5) emailVerificationChallenges.delete(identity.uid);
+      return next(new ApiError(400, 'VERIFICATION_CODE_INVALID', 'validation', 'Verification code is invalid.', 'Kode verifikasi salah. Periksa email dan coba lagi.'));
+    }
+
+    const userPath = `users/${identity.uid}`;
+    const user = await firestoreRequest(idToken, firestoreDocumentName(userPath));
+    const fields = user?.fields || {};
+    const updateTime = user?.updateTime;
+    if (!updateTime) {
+      return next(new ApiError(404, 'USER_PROFILE_NOT_FOUND', 'not_found', 'User profile was not found.', 'Profil akun belum tersedia. Silakan login ulang.'));
+    }
+
+    const updates = { ...fields, emailVerified: toFirestoreValue(true), updatedAt: toFirestoreValue(new Date().toISOString()) };
+    await commitFirestoreWrites(idToken, [{
+      update: { name: firestoreDocumentName(userPath), fields: updates },
+      updateMask: { fieldPaths: ['emailVerified', 'updatedAt'] },
+      currentDocument: { updateTime },
+    }]);
+    emailVerificationChallenges.delete(identity.uid);
+    res.json({ success: true, emailVerified: true });
+  } catch (err) {
+    return next(err);
+  }
 });
 
 app.post('/api/wallet/authorize-financial-action', (req: Request, res: Response, next) => {
@@ -1667,24 +1849,9 @@ app.post('/api/exchange/test-all-coins-execution', async (req: Request, res: Res
 // ==========================================
 // P2P MEMBER TRANSFER API
 // ==========================================
-interface DirectoryMemberRecord {
-  memberId: string;
-  username: string;
-  accountStatus: 'active' | 'non-active';
-  emailMasked: string;
-}
-
-const SERVER_DIRECTORY_MEMBERS: Record<string, DirectoryMemberRecord> = {
-  'GN-10001': { memberId: 'GN-10001', username: 'Master GAIN Foundation', accountStatus: 'active', emailMasked: 'mas***@gainkoin.io' },
-  'GN-10823': { memberId: 'GN-10823', username: 'sinonnggi (Sponsor)', accountStatus: 'active', emailMasked: 'sin***@gmail.com' },
-  'GN-20419': { memberId: 'GN-20419', username: 'tera_areh', accountStatus: 'active', emailMasked: 'ter***@yahoo.com' },
-  'GN-31952': { memberId: 'GN-31952', username: 'wGLmfcbq', accountStatus: 'active', emailMasked: 'wgl***@gmail.com' },
-  'GN-45812': { memberId: 'GN-45812', username: 'Budi Santoso (Surabaya)', accountStatus: 'non-active', emailMasked: 'bud***@gmail.com' },
-  'GN-58903': { memberId: 'GN-58903', username: 'Hendra Crypto (Bandung)', accountStatus: 'active', emailMasked: 'hen***@gmail.com' },
-};
-
-app.post('/api/member/transfer', (req: Request, res: Response, next) => {
+app.post('/api/member/transfer', async (req: Request, res: Response, next) => {
   try {
+    const { identity, idToken } = await requireFirebaseIdentity(req);
     const { senderMemberId, recipientMemberId, amount, note, otp2fa } = req.body;
     const numAmount = parseFloat(amount);
 
@@ -1702,26 +1869,36 @@ app.post('/api/member/transfer', (req: Request, res: Response, next) => {
     }
 
     const cleanRecipientId = recipientMemberId.trim().toUpperCase();
-    if (senderMemberId && cleanRecipientId === senderMemberId.toString().trim().toUpperCase()) {
+    const senderDocument = await firestoreRequest(idToken, firestoreDocumentName(`users/${identity.uid}`), {}, true);
+    const senderId = senderDocument?.fields?.memberId?.stringValue;
+    if (!senderId || senderId !== senderMemberId) {
+      return next(new ApiError(403, 'TRANSFER_SENDER_MISMATCH', 'authorization', 'Sender Member ID does not match the authenticated account.', 'ID Member pengirim tidak sesuai dengan akun login.'));
+    }
+    if (cleanRecipientId === senderId) {
       return next(new ApiError(400, 'TRANSFER_SELF_NOT_ALLOWED', 'validation', 'A member cannot transfer to itself.', 'Anda tidak dapat melakukan transfer ke akun member Anda sendiri.'));
     }
-    const recipient = SERVER_DIRECTORY_MEMBERS[cleanRecipientId] || {
-      memberId: cleanRecipientId,
-      username: `Member ${cleanRecipientId}`,
-      accountStatus: 'active',
-      emailMasked: 'usr***@gain.io',
+    const recipientDocument = await firestoreRequest(idToken, firestoreDocumentName(`member_directory/${cleanRecipientId}`), {}, true);
+    const recipientFields = recipientDocument?.fields;
+    const recipientId = recipientFields?.memberId?.stringValue;
+    if (!recipientId) {
+      return next(new ApiError(404, 'TRANSFER_RECIPIENT_NOT_FOUND', 'not_found', 'Transfer recipient was not found.', 'Member penerima tidak ditemukan.'));
+    }
+    const recipient = {
+      memberId: recipientId,
+      username: recipientFields.username?.stringValue || 'Member',
     };
 
     const txId = `tx-trf-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
     const txHash = `0x${Buffer.from(txId).toString('hex').padEnd(64, '0').slice(0, 64)}`;
 
-    logAuditEvent(req, res, 'wallet.transfer.accepted', { amount: numAmount });
+    logAuditEvent(req, res, 'wallet.transfer.accepted', { amount: numAmount, memberId: senderId, recipientMemberId: recipient.memberId });
     res.json({
       success: true,
       message: `Transfer ${numAmount.toFixed(2)} USDT ke ${recipient.username} (${recipient.memberId}) berhasil diproses!`,
       txId,
       txHash,
       recipientMemberId: recipient.memberId,
+      senderMemberId: senderId,
       recipientName: recipient.username,
       amount: numAmount,
       fee: 0,
@@ -1734,107 +1911,172 @@ app.post('/api/member/transfer', (req: Request, res: Response, next) => {
 });
 
 // ==========================================
-// SECURE ACCOUNT ACTIVATION & LIFETIME LICENSE VALIDATION API
-// Tier 1: $200 Normal -> $100 Promo (5 Bot Aktif, Draft Tanpa Batas, $20 Bonus Gas)
-// Tier 2: $350 Normal -> $175 Promo (10 Bot Aktif, Draft Tanpa Batas, $35 Bonus Gas)
-// Upgrade: $75 difference + $15 Gas Bonus
+// FIRESTORE-BACKED LIFETIME LICENSE ACTIVATION
 // ==========================================
-app.post('/api/wallet/process-activation', (req: Request, res: Response, next) => {
+app.post('/api/wallet/process-activation', async (req: Request, res: Response, next) => {
   try {
-    const {
-      userId,
-      memberId,
-      liquidBalance,
-      tier = 'starter_5',
-      isUpgrade = false,
-    } = req.body;
-
-    if (!userId || !memberId) {
-      return next(new ApiError(400, 'ACTIVATION_IDENTITY_REQUIRED', 'validation', 'User and member identity are required.', 'Identitas user dan ID Member diperlukan untuk aktivasi lisensi.'));
+    const { identity, idToken } = await requireFirebaseIdentity(req);
+    const tier = req.body?.tier;
+    const userPath = `users/${identity.uid}`;
+    if (req.body?.userId !== identity.uid || !['starter_6', 'pro_12'].includes(tier)) {
+      return next(new ApiError(400, 'ACTIVATION_REQUEST_INVALID', 'validation', 'Activation request is invalid.', 'Permintaan aktivasi tidak valid. Muat ulang akun dan coba lagi.'));
     }
 
-    const currentBalance = Number(liquidBalance);
-
-    let fee = 100;
-    let maxActiveBots = 5;
-    let tradingBonus = 20; // 20% from $100
-    let referralBonus = 20; // 20% from $100
-    let planName = 'Starter Lifetime (5 Bot Aktif)';
-    let normalPrice = 200;
-    let promoPrice = 100;
-
-    if (tier === 'pro_10') {
-      normalPrice = 350;
-      promoPrice = 175;
-      maxActiveBots = 10;
-      if (isUpgrade) {
-        fee = 75; // 175 - 100
-        tradingBonus = 15; // 35 - 20
-        referralBonus = 15; // 35 - 20
-        planName = 'Upgrade ke Pro Lifetime (10 Bot Aktif)';
-      } else {
-        fee = 175;
-        tradingBonus = 35; // 20% from $175
-        referralBonus = 35; // 20% from $175
-        planName = 'Pro Lifetime (10 Bot Aktif)';
-      }
-    } else {
-      fee = 100;
-      tradingBonus = 20;
-      referralBonus = 20;
-      maxActiveBots = 5;
-      planName = 'Starter Lifetime (5 Bot Aktif)';
+    const user = await firestoreRequest(idToken, firestoreDocumentName(userPath));
+    const fields = user?.fields || {};
+    const updateTime = user?.updateTime;
+    if (!updateTime) {
+      return next(new ApiError(404, 'USER_PROFILE_NOT_FOUND', 'not_found', 'User profile was not found.', 'Profil akun belum tersedia. Silakan login ulang.'));
+    }
+    if (fields.emailVerified?.booleanValue !== true) {
+      return next(new ApiError(403, 'EMAIL_VERIFICATION_REQUIRED', 'authorization', 'Email must be verified before activation.', 'Verifikasi email sebelum mengaktifkan lisensi.'));
     }
 
-    if (!Number.isFinite(currentBalance) || currentBalance < fee) {
+    const currentBalance = firestoreNumber(fields.liquidBalance);
+    const accountStatus = fields.accountStatus?.stringValue || 'non-active';
+    const existingTier = fields.licenseTier?.stringValue || '';
+    const isUpgrade = tier === 'pro_12' && accountStatus === 'active' && ['starter_6', 'starter_5'].includes(existingTier);
+    const isAlreadyActive = accountStatus === 'active' && !isUpgrade;
+    if (isAlreadyActive) {
+      return next(new ApiError(409, 'LICENSE_ALREADY_ACTIVE', 'conflict', 'The requested license is already active.', 'Lisensi akun sudah aktif.'));
+    }
+
+    const isPro = tier === 'pro_12';
+    const fee = isPro ? (isUpgrade ? 100 : 250) : 150;
+    const tradingBonus = isPro ? (isUpgrade ? 40 : 100) : 60;
+    const maxActiveBots = isPro ? 12 : 6;
+    const planName = isUpgrade
+      ? 'Upgrade ke Pro Lifetime (12 Bot Aktif)'
+      : `Lisensi Lifetime ${isPro ? 'Pro (12 Bot Aktif)' : 'Starter (6 Bot Aktif)'}`;
+    const normalPrice = isPro ? 500 : 300;
+    const promoPrice = isPro ? 250 : 150;
+
+    if (currentBalance < fee) {
       return next(new ApiError(
         400,
         'ACTIVATION_BALANCE_INSUFFICIENT',
         'validation',
         'Wallet balance is insufficient for activation.',
-        `Saldo tidak mencukupi untuk aktivasi ${planName}. Diperlukan minimal ${fee.toFixed(2)} USDT di saldo wallet GAIN Anda (Saldo saat ini: ${Number.isFinite(currentBalance) ? currentBalance.toFixed(2) : '0.00'} USDT). Silakan lakukan deposit saldo terlebih dahulu.`
+        `Saldo tidak mencukupi untuk aktivasi ${planName}. Diperlukan ${fee.toFixed(2)} USDT; saldo saat ini ${currentBalance.toFixed(2)} USDT.`
       ));
     }
 
     const newLiquidBalance = Number((currentBalance - fee).toFixed(2));
-    const activationId = `act-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
-    const txId = `tx-act-${Date.now()}`;
-    const txHash = `0x${Buffer.from(activationId).toString('hex').padEnd(64, '0').slice(0, 64)}`;
+    const now = new Date().toISOString();
+    const activationId = `act-${Date.now()}-${randomInt(1000, 10000)}`;
+    const txId = `tx-${activationId}`;
+    const licenseTier = isPro ? 'pro_12' : 'starter_6';
+    const newGasReserve = Number((firestoreNumber(fields.gasReserve) + tradingBonus).toFixed(2));
+    const newTotalOutflow = Number((firestoreNumber(fields.totalOutflow) + fee).toFixed(2));
+    const newTotalInflow = Number((firestoreNumber(fields.totalInflow) + tradingBonus).toFixed(2));
+    const userUpdates: Record<string, unknown> = {
+      liquidBalance: newLiquidBalance,
+      gasReserve: newGasReserve,
+      totalOutflow: newTotalOutflow,
+      totalInflow: newTotalInflow,
+      accountStatus: 'active',
+      licenseTier,
+      licenseType: 'lifetime',
+      licenseName: planName,
+      maxActiveBots,
+      tradingBonusUsdt: Number((firestoreNumber(fields.tradingBonusUsdt) + tradingBonus).toFixed(2)),
+      activationFeeUsdt: Number((firestoreNumber(fields.activationFeeUsdt) + fee).toFixed(2)),
+      updatedAt: now,
+    };
+    const transaction = {
+      id: txId,
+      userId: identity.uid,
+      memberId: fields.memberId?.stringValue || '',
+      title: planName,
+      type: 'outflow',
+      status: 'Success',
+      statusColor: 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20',
+      timestamp: now,
+      createdAt: now,
+      counterparty: 'GAIN Foundation Licensing Node',
+      counterpartyLabel: 'License: ',
+      amount: -fee,
+      amountFormatted: `-${fee.toFixed(2)} USDT`,
+      feeInfo: 'Lifetime License (Bukan Sewa Tahunan)',
+      network: 'Internal Wallet',
+    };
+    const bonusTransaction = {
+      id: `tx-bonus-${activationId}`,
+      userId: identity.uid,
+      memberId: fields.memberId?.stringValue || '',
+      sourceMemberId: 'SYSTEM',
+      bonusType: 'activation_gas',
+      title: `Bonus Gas Fee (+${tradingBonus} USDT)`,
+      type: 'inflow',
+      status: 'Gas Tank',
+      statusColor: 'bg-teal-500/10 text-teal-400 border-teal-500/20',
+      timestamp: now,
+      createdAt: now,
+      counterparty: 'GAIN Promo Pool',
+      counterpartyLabel: 'Promo: ',
+      amount: tradingBonus,
+      amountFormatted: `+${tradingBonus.toFixed(2)} USDT`,
+      feeInfo: 'Otomatis Masuk ke Gas Fee Tank',
+      network: 'Gas Tank',
+    };
+    const userDocumentName = firestoreDocumentName(userPath);
+    const txDocumentName = firestoreDocumentName(`${userPath}/transactions/${txId}`);
+    const bonusDocumentName = firestoreDocumentName(`${userPath}/transactions/${bonusTransaction.id}`);
+    const writes: unknown[] = [
+      {
+        update: { name: userDocumentName, fields: { ...fields, ...toFirestoreFields(userUpdates) } },
+        updateMask: { fieldPaths: Object.keys(userUpdates) },
+        currentDocument: { updateTime },
+      },
+      { update: { name: txDocumentName, fields: toFirestoreFields(transaction) }, currentDocument: { exists: false } },
+      { update: { name: bonusDocumentName, fields: toFirestoreFields(bonusTransaction) }, currentDocument: { exists: false } },
+    ];
+    const memberId = fields.memberId?.stringValue;
+    if (typeof memberId === 'string' && memberId) {
+      const directoryDocumentName = firestoreDocumentName(`member_directory/${memberId}`);
+      const directoryDocument = await firestoreRequest(idToken, directoryDocumentName, {}, true);
+      if (directoryDocument?.updateTime) {
+        writes.push({
+          update: { name: directoryDocumentName, fields: { accountStatus: toFirestoreValue('active') } },
+          updateMask: { fieldPaths: ['accountStatus'] },
+          currentDocument: { updateTime: directoryDocument.updateTime },
+        });
+      }
+    }
+    await commitFirestoreWrites(idToken, writes);
 
     logAuditEvent(req, res, 'wallet.activation.accepted', {
-      tier: tier === 'pro_10' ? 'pro_10' : 'starter_5',
+      tier: licenseTier,
       amount: fee,
     });
     res.json({
       success: true,
-      message: `Aktivasi ${planName} berhasil diverifikasi! Bonus fee trading $${tradingBonus.toFixed(2)} USDT (20%) otomatis ditambahkan ke Gas Fee Tank Anda.`,
+      message: `Aktivasi ${planName} berhasil. Bonus gas ${tradingBonus.toFixed(2)} USDT ditambahkan ke Gas Tank.`,
       accountStatus: 'active',
-      licenseTier: tier === 'pro_10' ? 'pro_10' : 'starter_5',
+      licenseTier,
       licenseType: 'lifetime',
-      licenseName: tier === 'pro_10' ? 'Pro Lifetime (10 Bot Aktif)' : 'Starter Lifetime (5 Bot Aktif)',
+      licenseName: planName,
       maxActiveBots,
       feeDeducted: fee,
       tradingBonusGranted: tradingBonus,
-      referralBonusGranted: referralBonus,
       newLiquidBalance,
+      newGasReserve,
       activationReceipt: {
         activationId,
         txId,
-        txHash,
-        memberId,
-        userId,
-        timestamp: Date.now(),
+        userId: identity.uid,
+        memberId: fields.memberId?.stringValue || '',
+        timestamp: now,
         licenseType: 'lifetime',
         plan: planName,
         normalPrice,
         promoPrice,
         discountPct: 50,
         tradingBonusUsdt: tradingBonus,
-        referralBonusUsdt: referralBonus,
         maxActiveBots,
       },
     });
-  } catch (err: any) {
+  } catch (err) {
     return next(err);
   }
 });
