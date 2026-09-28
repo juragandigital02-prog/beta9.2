@@ -1,0 +1,569 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "User profile, account info, and algorithmic wallet balances",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "User identifier matching auth.uid",
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "username": {
+          "type": "string",
+          "description": "Display username",
+          "maxLength": 64
+        },
+        "email": {
+          "type": "string",
+          "description": "Email address",
+          "maxLength": 128
+        },
+        "memberId": {
+          "type": "string",
+          "description": "Short referral member code",
+          "maxLength": 32,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "vipTier": {
+          "type": "string",
+          "description": "VIP Tier Level",
+          "maxLength": 16
+        },
+        "accountStatus": {
+          "type": "string",
+          "description": "Account licensing status",
+          "enum": ["active", "non-active"]
+        },
+        "role": {
+          "type": "string",
+          "description": "User role level",
+          "enum": ["user", "admin"]
+        },
+        "activationFeeUsdt": {
+          "type": "number",
+          "description": "Lifetime bot license activation fee in USDT"
+        },
+        "licenseTier": {
+          "type": "string",
+          "description": "Lifetime license tier (starter_6, pro_12, starter_5, or pro_10)",
+          "enum": ["starter_6", "pro_12", "starter_5", "pro_10"]
+        },
+        "licenseType": {
+          "type": "string",
+          "description": "License duration type",
+          "enum": ["lifetime"]
+        },
+        "licenseName": {
+          "type": "string",
+          "description": "Display name of the license tier"
+        },
+        "maxActiveBots": {
+          "type": "number",
+          "description": "Maximum number of concurrent active bots allowed"
+        },
+        "tradingBonusUsdt": {
+          "type": "number",
+          "description": "Free trading gas bonus granted on activation"
+        },
+        "sponsorId": {
+          "type": "string",
+          "description": "Sponsor member ID",
+          "maxLength": 32
+        },
+        "sponsorName": {
+          "type": "string",
+          "description": "Sponsor display name",
+          "maxLength": 64
+        },
+        "directReferralsCount": {
+          "type": "number",
+          "description": "Number of direct referrals"
+        },
+        "teamTurnoverUsdt": {
+          "type": "number",
+          "description": "Team turnover in USDT"
+        },
+        "totalReferralBonusUsdt": {
+          "type": "number",
+          "description": "Total referral bonuses in USDT"
+        },
+        "liquidBalance": {
+          "type": "number",
+          "description": "Total liquid balance in USDT"
+        },
+        "availableCash": {
+          "type": "number",
+          "description": "Available cash balance in USDT"
+        },
+        "gasReserve": {
+          "type": "number",
+          "description": "Gas fee reserve balance in USDT"
+        },
+        "totalInflow": {
+          "type": "number",
+          "description": "Total inflow in USDT"
+        },
+        "totalOutflow": {
+          "type": "number",
+          "description": "Total outflow in USDT"
+        },
+        "gasConsumed": {
+          "type": "number",
+          "description": "Gas consumed in USDT"
+        },
+        "referralYield": {
+          "type": "number",
+          "description": "Referral yield in USDT"
+        },
+        "nonCashGasBonus": {
+          "type": "number",
+          "description": "Accumulated 20% non-cash topup bonus from downlines for gas fee tank fuel (non-withdrawable)"
+        },
+        "withdrawableTradingYield": {
+          "type": "number",
+          "description": "Accumulated 20% cash trading profit share from management 20% trading fee, fully withdrawable"
+        },
+        "allocatedAssetUsdt": {
+          "type": "number",
+          "description": "Total allocated assets in USDT"
+        },
+        "volume24h": {
+          "type": "number",
+          "description": "24h trading volume in USDT"
+        },
+        "twoFactorEnabled": {
+          "type": "boolean",
+          "description": "Whether Google 2FA Authenticator is enabled"
+        },
+        "twoFactorSecret": {
+          "type": "string",
+          "description": "Base32 secret key for Google 2FA Authenticator",
+          "maxLength": 64
+        },
+        "connectedExchange": {
+          "type": "object",
+          "description": "Currently active connected cryptocurrency exchange configuration"
+        },
+        "connectedExchanges": {
+          "type": "array",
+          "description": "List of all cryptocurrency exchanges connected to this Google account / user",
+          "items": {
+            "type": "object"
+          }
+        },
+        "activeExchange": {
+          "type": "string",
+          "description": "Name of currently active primary exchange (e.g. Reku, Binance, Bybit, Bitget, OKX, Tokocrypto, Indodax)"
+        },
+        "createdAt": {
+          "type": "string",
+          "description": "ISO timestamp of user creation"
+        },
+        "updatedAt": {
+          "type": "string",
+          "description": "ISO timestamp of last update"
+        }
+      },
+      "required": [
+        "id",
+        "username",
+        "email",
+        "memberId",
+        "liquidBalance",
+        "availableCash",
+        "gasReserve"
+      ]
+    },
+    "TradingPosition": {
+      "title": "TradingPosition",
+      "description": "Algorithmic bot trading position for crypto pair",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique position identifier",
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "userId": {
+          "type": "string",
+          "description": "Owner user ID",
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "pair": {
+          "type": "string",
+          "description": "Trading pair e.g. BTC/USDT",
+          "maxLength": 32
+        },
+        "coin": {
+          "type": "string",
+          "description": "Coin ticker e.g. BTC",
+          "maxLength": 16
+        },
+        "status": {
+          "type": "string",
+          "description": "Position status",
+          "enum": ["active", "averaging", "inactive"]
+        },
+        "statusLabel": {
+          "type": "string",
+          "description": "Display status badge",
+          "maxLength": 32
+        },
+        "engine": {
+          "type": "string",
+          "description": "Engine name",
+          "maxLength": 64
+        },
+        "price": {
+          "type": "number",
+          "description": "Current asset price in USD"
+        },
+        "change24h": {
+          "type": "number",
+          "description": "24h change percent"
+        },
+        "floatingPnl": {
+          "type": "number",
+          "description": "Floating profit/loss in USDT"
+        },
+        "roiPct": {
+          "type": "number",
+          "description": "Return on investment percentage"
+        },
+        "allocationUsdt": {
+          "type": "string",
+          "description": "Formatted allocation USDT",
+          "maxLength": 32
+        },
+        "allocationQty": {
+          "type": "string",
+          "description": "Formatted asset quantity",
+          "maxLength": 32
+        },
+        "stepLayer": {
+          "type": "number",
+          "description": "Current step in the 100-layer matrix"
+        },
+        "maxStep": {
+          "type": "number",
+          "description": "Maximum steps configured"
+        },
+        "layerQuota": {
+          "type": "string",
+          "description": "Display layer quota info",
+          "maxLength": 64
+        },
+        "trailingProgressPct": {
+          "type": "number",
+          "description": "Progress towards trailing TP"
+        },
+        "trailingInfo": {
+          "type": "string",
+          "description": "Trailing details",
+          "maxLength": 64
+        },
+        "minPrice": {
+          "type": "number",
+          "description": "Minimum floor price boundary"
+        },
+        "maxPrice": {
+          "type": "number",
+          "description": "Maximum ceiling price boundary"
+        },
+        "priceBoundaryStatus": {
+          "type": "string",
+          "description": "Price boundary status: IN_RANGE, ABOVE_MAX, or BELOW_MIN",
+          "enum": ["IN_RANGE", "ABOVE_MAX", "BELOW_MIN"]
+        },
+        "updatedAt": {
+          "type": "string",
+          "description": "Last update timestamp"
+        }
+      },
+      "required": [
+        "id",
+        "userId",
+        "pair",
+        "coin",
+        "status",
+        "price",
+        "floatingPnl",
+        "stepLayer"
+      ]
+    },
+    "TransactionRecord": {
+      "title": "TransactionRecord",
+      "description": "Financial ledger mutation or audit record",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Transaction ID",
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "userId": {
+          "type": "string",
+          "description": "User ID of owner",
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "title": {
+          "type": "string",
+          "description": "Transaction title or action",
+          "maxLength": 64
+        },
+        "type": {
+          "type": "string",
+          "description": "Transaction classification",
+          "enum": ["inflow", "outflow", "gas"]
+        },
+        "status": {
+          "type": "string",
+          "description": "Status label",
+          "maxLength": 32
+        },
+        "statusColor": {
+          "type": "string",
+          "description": "Tailwind badge style classes",
+          "maxLength": 128
+        },
+        "timestamp": {
+          "type": "string",
+          "description": "Display timestamp",
+          "maxLength": 64
+        },
+        "counterparty": {
+          "type": "string",
+          "description": "Counterparty address, member ID, or source",
+          "maxLength": 128
+        },
+        "counterpartyLabel": {
+          "type": "string",
+          "description": "Prefix label for counterparty",
+          "maxLength": 32
+        },
+        "amount": {
+          "type": "number",
+          "description": "Numeric delta in USDT"
+        },
+        "amountFormatted": {
+          "type": "string",
+          "description": "Formatted amount string",
+          "maxLength": 64
+        },
+        "feeInfo": {
+          "type": "string",
+          "description": "Fee disclosure string",
+          "maxLength": 64
+        },
+        "createdAt": {
+          "type": "string",
+          "description": "Creation timestamp"
+        }
+      },
+      "required": [
+        "id",
+        "userId",
+        "title",
+        "type",
+        "status",
+        "amount",
+        "amountFormatted"
+      ]
+    },
+    "TradeRecord": {
+      "title": "TradeRecord",
+      "description": "Historical closed or executed spot trading orders and bot fills",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Trade unique record ID",
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "userId": {
+          "type": "string",
+          "description": "Owner user ID",
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "orderId": {
+          "type": "string",
+          "description": "Exchange order identifier"
+        },
+        "exchange": {
+          "type": "string",
+          "description": "Exchange name e.g. BINANCE, BITGET"
+        },
+        "symbol": {
+          "type": "string",
+          "description": "Trading pair e.g. BTC/USDT"
+        },
+        "side": {
+          "type": "string",
+          "description": "Order side buy or sell",
+          "enum": ["buy", "sell"]
+        },
+        "type": {
+          "type": "string",
+          "description": "Order type limit or market"
+        },
+        "price": {
+          "type": "number",
+          "description": "Execution unit price in USDT"
+        },
+        "amount": {
+          "type": "number",
+          "description": "Executed asset quantity"
+        },
+        "costUsdt": {
+          "type": "number",
+          "description": "Total order cost in USDT"
+        },
+        "realizedPnl": {
+          "type": "number",
+          "description": "Realized profit or loss in USDT"
+        },
+        "pnlPercent": {
+          "type": "number",
+          "description": "Profit or loss percentage"
+        },
+        "timestamp": {
+          "type": "number",
+          "description": "Epoch timestamp"
+        },
+        "datetime": {
+          "type": "string",
+          "description": "Formatted date time string"
+        },
+        "status": {
+          "type": "string",
+          "description": "Order status filled or closed"
+        },
+        "strategyName": {
+          "type": "string",
+          "description": "Trading bot strategy name"
+        },
+        "layerStep": {
+          "type": "number",
+          "description": "100-step averaging layer step"
+        },
+        "isSandbox": {
+          "type": "boolean",
+          "description": "Whether trade occurred in sandbox / testnet"
+        }
+      },
+      "required": [
+        "id",
+        "userId",
+        "symbol",
+        "side",
+        "price",
+        "amount",
+        "costUsdt"
+      ]
+    },
+    "MemberDirectoryItem": {
+      "title": "MemberDirectoryItem",
+      "description": "Public directory entry for member lookups and P2P transfers",
+      "type": "object",
+      "properties": {
+        "memberId": {
+          "type": "string",
+          "description": "Unique GAIN member ID (e.g., GN-10823)",
+          "maxLength": 32
+        },
+        "userId": {
+          "type": "string",
+          "description": "User identifier matching auth.uid",
+          "maxLength": 128
+        },
+        "username": {
+          "type": "string",
+          "description": "Display username",
+          "maxLength": 64
+        },
+        "vipTier": {
+          "type": "string",
+          "description": "VIP Tier Level",
+          "maxLength": 16
+        },
+        "accountStatus": {
+          "type": "string",
+          "description": "Account licensing status",
+          "enum": ["active", "non-active"]
+        },
+        "role": {
+          "type": "string",
+          "description": "Member role (user, admin)",
+          "enum": ["user", "admin"]
+        },
+        "emailMasked": {
+          "type": "string",
+          "description": "Masked email address for privacy",
+          "maxLength": 64
+        },
+        "sponsorId": {
+          "type": "string",
+          "description": "Member ID of the sponsor upline",
+          "maxLength": 32
+        },
+        "joinedAt": {
+          "type": "string",
+          "description": "ISO timestamp when member joined"
+        }
+      },
+      "required": [
+        "memberId",
+        "userId",
+        "username",
+        "vipTier",
+        "emailMasked"
+      ]
+    },
+    "NetworkMember": {
+      "title": "NetworkMember",
+      "description": "Affiliate network downline member",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "memberId": { "type": "string" },
+        "name": { "type": "string" },
+        "emailMasked": { "type": "string" },
+        "sponsorId": { "type": "string" },
+        "joinDate": { "type": "string" },
+        "accountStatus": { "type": "string", "enum": ["active", "non-active"] },
+        "botStatus": { "type": "string" },
+        "exchangeConnected": { "type": "string" },
+        "totalTurnoverUsdt": { "type": "number" },
+        "bonusYieldUsdt": { "type": "number" }
+      }
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "User",
+      "description": "User account, wallet balances, and portfolio metrics"
+    },
+    "/users/{userId}/positions/{positionId}": {
+      "schema": "TradingPosition",
+      "description": "Active algorithmic trading positions for the user"
+    },
+    "/users/{userId}/transactions/{transactionId}": {
+      "schema": "TransactionRecord",
+      "description": "Financial ledger transactions and mutations"
+    },
+    "/users/{userId}/trade_history/{tradeId}": {
+      "schema": "TradeRecord",
+      "description": "Historical executed trades and closed bot positions"
+    },
+    "/users/{userId}/network/{networkId}": {
+      "schema": "NetworkMember",
+      "description": "Network referrals and downlines"
+    },
+    "/member_directory/{memberId}": {
+      "schema": "MemberDirectoryItem",
+      "description": "Searchable member directory for internal transfers and sponsor verification"
+    }
+  }
+}

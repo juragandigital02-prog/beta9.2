@@ -1,0 +1,109 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function hasRole(roleName) {
+      return isSignedIn() && request.auth.token.role == roleName;
+    }
+
+    function isAdmin() {
+      return hasRole('super_admin') || hasRole('admin');
+    }
+
+    function isUserOwnedDocument(userId) {
+      return isOwner(userId) && request.resource.data.userId == userId;
+    }
+
+    function hasOnlyPublicMemberFields() {
+      return request.resource.data.keys().hasOnly([
+        'memberId',
+        'userId',
+        'username',
+        'accountStatus',
+        'emailMasked',
+        'sponsorId',
+        'sponsorName',
+        'joinedAt'
+      ]);
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    match /test/{docId} {
+      allow read: if true;
+      allow write: if false;
+    }
+
+    match /users/{userId} {
+      allow get: if isOwner(userId) || isAdmin();
+      allow list: if isAdmin();
+      allow create: if isOwner(userId) && request.resource.data.id == userId;
+      allow update: if isOwner(userId) && request.resource.data.id == userId;
+      allow delete: if isAdmin();
+
+      match /positions/{positionId} {
+        allow get, list: if isOwner(userId) || isAdmin();
+        allow create: if isUserOwnedDocument(userId) && request.resource.data.userId == userId;
+        allow update: if isUserOwnedDocument(userId) && request.resource.data.userId == userId;
+        allow delete: if isOwner(userId) || isAdmin();
+      }
+
+      match /transactions/{transactionId} {
+        allow get, list: if isOwner(userId) || isAdmin();
+        allow create: if isUserOwnedDocument(userId) && request.resource.data.userId == userId;
+        allow update: if isAdmin();
+        allow delete: if isAdmin();
+      }
+
+      match /trade_history/{tradeId} {
+        allow get, list: if isOwner(userId) || isAdmin();
+        allow create: if isUserOwnedDocument(userId) && request.resource.data.userId == userId;
+        allow update: if isUserOwnedDocument(userId) && request.resource.data.userId == userId;
+        allow delete: if isAdmin();
+      }
+
+      match /network/{networkId} {
+        allow get, list: if isOwner(userId) || isAdmin();
+        allow create: if isUserOwnedDocument(userId) && request.resource.data.userId == userId;
+        allow update: if isUserOwnedDocument(userId) && request.resource.data.userId == userId;
+        allow delete: if isAdmin();
+      }
+
+      match /price_alerts/{alertId} {
+        allow get, list: if isOwner(userId) || isAdmin();
+        allow create: if isUserOwnedDocument(userId) && request.resource.data.userId == userId;
+        allow update: if isUserOwnedDocument(userId) && request.resource.data.userId == userId;
+        allow delete: if isOwner(userId) || isAdmin();
+      }
+
+      match /wallet_ledger/{entryId} {
+        allow get, list: if isOwner(userId) || isAdmin();
+        allow create, update, delete: if false;
+      }
+    }
+
+    match /member_directory/{memberId} {
+      allow get: if isSignedIn()
+        && !resource.data.keys().hasAny(['emailFull', 'liquidBalance', 'gasReserve', 'depositAddress', 'role']);
+      allow list: if false;
+      allow create: if isOwner(request.resource.data.userId)
+        && request.resource.data.memberId == memberId
+        && hasOnlyPublicMemberFields();
+      allow update: if isOwner(resource.data.userId)
+        && request.resource.data.userId == resource.data.userId
+        && request.resource.data.memberId == memberId
+        && hasOnlyPublicMemberFields();
+      allow delete: if isAdmin();
+    }
+  }
+}
